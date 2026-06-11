@@ -3609,6 +3609,7 @@
       <modules>
         <module>resource-managers/yarn</module>
         <module>common/network-yarn</module>
+        <module>spark-yarn-client</module>
       </modules>
     </profile>
 

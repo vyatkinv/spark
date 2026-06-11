@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one or more
+  ~ contributor license agreements.  See the NOTICE file distributed with
+  ~ this work for additional information regarding copyright ownership.
+  ~ The ASF licenses this file to You under the Apache License, Version 2.0
+  ~ (the "License"); you may not use this file except in compliance with
+  ~ the License.  You may obtain a copy of the License at
+  ~
+  ~    http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing, software
+  ~ distributed under the License is distributed on an "AS IS" BASIS,
+  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~ See the License for the specific language governing permissions and
+  ~ limitations under the License.
+  -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.apache.spark</groupId>
+    <artifactId>spark-parent_2.12</artifactId>
+    <version>3.5.9-SNAPSHOT</version>
+    <relativePath>../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>spark-yarn-client_2.12</artifactId>
+  <packaging>jar</packaging>
+  <name>Spark YARN Client</name>
+  <url>https://spark.apache.org/</url>
+  <description>
+    Lightweight Java client for submitting Spark jobs to YARN without a local Spark installation.
+    Replicates spark-submit YARN cluster submission directly via Hadoop YARN API.
+    Supports HDFS fat-JAR upload and Kerberos authentication.
+  </description>
+
+  <properties>
+    <sbt.project.name>yarn-client</sbt.project.name>
+  </properties>
+
+  <dependencies>
+    <!-- ===== Main dependencies ===== -->
+
+    <!--
+      hadoop-common: Configuration, UserGroupInformation (Kerberos).
+      hadoop-hdfs-client: FileSystem / HDFS client.
+      hadoop-yarn-client: YarnClient, ContainerLaunchContext, LocalResource, etc.
+      All scoped to ${hadoop.deps.scope} (defaults to "compile"; "provided" in Spark distributions).
+    -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-common</artifactId>
+      <version>${hadoop.version}</version>
+      <scope>${hadoop.deps.scope}</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>log4j</groupId>
+          <artifactId>log4j</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-log4j12</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-hdfs-client</artifactId>
+      <version>${hadoop.version}</version>
+      <scope>${hadoop.deps.scope}</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-yarn-client</artifactId>
+      <!-- version managed in parent dependencyManagement -->
+      <scope>${hadoop.deps.scope}</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <!-- version managed in parent dependencyManagement -->
+    </dependency>
+
+    <!-- ===== Test dependencies ===== -->
+
+    <!--
+      Non-shaded Hadoop test infrastructure. Using individual artifacts instead of
+      hadoop-client-minicluster, which shades javax.servlet to
+      org.apache.hadoop.shaded.javax.servlet, making Hadoop's built-in servlets
+      (FsckServlet, ImageServlet, etc.) incompatible with Jetty's type check for
+      javax.servlet.Servlet.
+
+      hadoop-hdfs (server-side classes: NameNode, DataNode, FsckServlet) must appear
+      on the classpath with real javax.servlet so Jetty accepts the servlets.
+      hadoop-hdfs:tests provides MiniDFSCluster.
+      hadoop-yarn-server-tests:tests provides MiniYARNCluster; version + exclusions
+      are managed by the parent pom dependencyManagement.
+      hadoop-yarn-server-resourcemanager is managed by the parent pom as well.
+    -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-hdfs</artifactId>
+      <version>${hadoop.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-hdfs</artifactId>
+      <version>${hadoop.version}</version>
+      <classifier>tests</classifier>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-common</artifactId>
+      <version>${hadoop.version}</version>
+      <classifier>tests</classifier>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>javax.servlet</groupId>
+          <artifactId>servlet-api</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-yarn-server-tests</artifactId>
+      <classifier>tests</classifier>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-yarn-server-resourcemanager</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- Used internally by MiniYARNCluster for TLS -->
+    <dependency>
+      <groupId>org.bouncycastle</groupId>
+      <artifactId>bcprov-jdk18on</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.bouncycastle</groupId>
+      <artifactId>bcpkix-jdk18on</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- Used internally by MiniDFSCluster / MiniYARNCluster -->
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <!-- version managed in parent dependencyManagement -->
+      <scope>test</scope>
+    </dependency>
+    <!-- MiniYARNCluster uses JUnit 4 Assert internally -->
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+      <!-- version managed in parent dependencyManagement -->
+      <scope>test</scope>
+    </dependency>
+
+    <!-- JUnit 5 for our own tests (not yet in parent dependencyManagement) -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.1</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- Logging for tests -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-slf4j2-impl</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <!--
+    No surefire overrides needed: the parent pom provides -Xmx4g and all
+    required JVM module-opens flags via the extraJavaTestArgs property.
+    Integration tests (MiniDFS + MiniYARN) run under maven-surefire-plugin,
+    exactly as spark-yarn does in resource-managers/yarn.
+  -->
+</project>
