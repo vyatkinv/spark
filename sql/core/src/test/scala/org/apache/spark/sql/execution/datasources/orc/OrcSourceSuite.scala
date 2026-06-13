@@ -643,6 +643,74 @@ abstract class OrcSourceSuite extends OrcSuite with SharedSparkSession {
     testSelectiveDictionaryEncoding(isSelective = true, isHiveOrc = false)
   }
 
+  // orc.dictionary.key.threshold = T means ORC uses DICTIONARY_V2 when
+  //   (distinct_values_in_stripe / total_rows_in_stripe) <= T,
+  // and falls back to DIRECT_V2 otherwise.
+  //
+  // High-cardinality columns (e.g. UUIDs) benefit from DIRECT because building
+  // a dictionary that stores every unique value wastes memory and slows writes.
+  // Low-cardinality columns (e.g. country codes) benefit from DICTIONARY because
+  // repeated short codes compress far better than raw strings.
+  test("orc.dictionary.key.threshold controls dictionary vs direct encoding by cardinality ratio") {
+    withTempPaths(2) { case Seq(base08, base10) =>
+      import testImplicits._
+
+      // withTempPaths creates the dirs upfront; write into subdirs to avoid PATH_ALREADY_EXISTS
+      val dir08 = new java.io.File(base08, "data")
+      val dir10 = new java.io.File(base10, "data")
+
+      val numRows = 10000
+      // low_card : 10 distinct values  → ratio = 10/10000 = 0.001 (0.1%)
+      // high_card: all unique values   → ratio = 10000/10000 = 1.0  (100%)
+      val df = (0 until numRows)
+        .map(i => (s"state-${i % 10}", s"uuid-$i"))
+        .toDF("low_card", "high_card")
+
+      // Helper: write one ORC file and return (low_card encoding, high_card encoding)
+      def encodingKinds(dir: java.io.File) = {
+        val partFile = dir.listFiles()
+          .filter(f => f.isFile && !f.getName.startsWith(".") && !f.getName.startsWith("_"))
+          .head
+        val reader = OrcFile.createReader(
+          new Path(partFile.getAbsolutePath), OrcFile.readerOptions(new Configuration()))
+        var rr: RecordReaderImpl = null
+        try {
+          rr = reader.rows.asInstanceOf[RecordReaderImpl]
+          val stripe = rr.readStripeFooter(reader.getStripes.get(0))
+          // ORC column index: 0 = top-level struct, 1 = low_card, 2 = high_card
+          (stripe.getColumns(1).getKind, stripe.getColumns(2).getKind)
+        } finally {
+          if (rr != null) rr.close()
+        }
+      }
+
+      // --- threshold = 0.8 ---
+      // low_card  ratio 0.1% ≤ 80%  → DICTIONARY_V2
+      // high_card ratio 100% > 80%  → DIRECT_V2
+      df.coalesce(1).write
+        .option("orc.dictionary.key.threshold", "0.8")
+        .orc(dir08.getCanonicalPath)
+
+      val (lowAt08, highAt08) = encodingKinds(dir08)
+      assert(lowAt08 === DICTIONARY_V2,
+        s"low_card (ratio 0.1%) must be DICTIONARY_V2 at threshold=0.8, got $lowAt08")
+      assert(highAt08 === DIRECT_V2,
+        s"high_card (ratio 100%) must be DIRECT_V2 at threshold=0.8, got $highAt08")
+
+      // --- threshold = 1.0 ---
+      // ratio <= 1.0 is always true → both columns stay DICTIONARY_V2
+      df.coalesce(1).write
+        .option("orc.dictionary.key.threshold", "1.0")
+        .orc(dir10.getCanonicalPath)
+
+      val (lowAt10, highAt10) = encodingKinds(dir10)
+      assert(lowAt10 === DICTIONARY_V2,
+        s"low_card must stay DICTIONARY_V2 at threshold=1.0, got $lowAt10")
+      assert(highAt10 === DICTIONARY_V2,
+        s"high_card (ratio 100%) must be DICTIONARY_V2 at threshold=1.0, got $highAt10")
+    }
+  }
+
   test("SPARK-11412 read and merge orc schemas in parallel") {
     testMergeSchemasInParallel(OrcUtils.readOrcSchemasInParallel)
   }
