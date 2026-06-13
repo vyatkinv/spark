@@ -20,9 +20,11 @@ library only eliminates the need for `spark-submit` on the submitting machine.
 6. [SparkJobConfig reference](#sparkjobconfig-reference)
 7. [Monitoring submitted applications](#monitoring-submitted-applications)
 8. [Kerberos](#kerberos)
-9. [YARN HA and HDFS HA](#yarn-ha-and-hdfs-ha)
-10. [Providing a custom Hadoop Configuration](#providing-a-custom-hadoop-configuration)
-11. [How it works](#how-it-works)
+9. [Java 8 clusters](#java-8-clusters)
+10. [YARN HA and HDFS HA](#yarn-ha-and-hdfs-ha)
+11. [Providing a custom Hadoop Configuration](#providing-a-custom-hadoop-configuration)
+12. [How it works](#how-it-works)
+13. [Running the tests](#running-the-tests)
 
 ---
 
@@ -220,6 +222,7 @@ single client instance. Build it once and reuse.
 | `kerberos(String principal, String keytabPath)` | no | disabled | Enable Kerberos — see [Kerberos](#kerberos) |
 | `javaHome(String)` | no | `$JAVA_HOME` | Path to Java on YARN cluster nodes, e.g. `/usr/lib/jvm/java-11`. Uses the `$JAVA_HOME` container environment variable by default |
 | `amClass(String)` | no | `org.apache.spark.deploy.yarn.ApplicationMaster` | Override the YARN ApplicationMaster class. Change only for custom Spark forks |
+| `addJava9ModuleOpens(boolean)` | no | `true` | Inject `--add-opens` JVM flags needed by Spark on Java 9+. Set to `false` when the YARN cluster runs Java 8 — Java 8 does not recognise these flags and will fail to start. See [Java 8 clusters](#java-8-clusters) |
 
 ### Precedence for Spark properties
 
@@ -497,3 +500,72 @@ The Spark ApplicationMaster running inside the YARN container reads
 `__spark_conf__.properties` on startup, finds the HDFS and YARN addresses embedded there,
 and proceeds to request executor containers exactly as it would after a normal
 `spark-submit` invocation.
+
+---
+
+## Java 8 clusters
+
+Spark on Java 9+ requires a set of `--add-opens` JVM flags to access internal JDK APIs
+(`sun.nio.ch.DirectBuffer`, `java.lang.invoke`, etc.). These flags are injected into the
+ApplicationMaster launch command and into `spark.executor.extraJavaOptions` by default.
+
+**Java 8 does not recognise `--add-opens`** and will immediately exit with an unrecognised
+option error. If your YARN cluster runs Java 8, disable the injection explicitly:
+
+```java
+SparkYarnConfig config = SparkYarnConfig.builder()
+    .hdfsUri("hdfs://namenode:8020")
+    .javaHome("/usr/lib/jvm/java-8-openjdk-amd64/jre")  // Java 8 path on cluster nodes
+    .addJava9ModuleOpens(false)                           // must be false for Java 8
+    .sparkConf("spark.yarn.jars", "hdfs:///spark/jars/*.jar")
+    .build();
+```
+
+The submitting machine can run any Java version — the `addJava9ModuleOpens` flag controls
+only what goes into the YARN container launch command, not the local JVM.
+
+> **Note**: Spark 3.x jars are compiled with a Java 21 toolchain and use covariant
+> `ByteBuffer` return types introduced in Java 9. Submitting Spark 3.x jars to a **pure
+> Java 8 JRE** will fail at runtime with `NoSuchMethodError: ByteBuffer.flip()`. If you
+> must run on Java 8, use a Spark build compiled with Java 8 (`-source 8 -target 8`).
+
+---
+
+## Running the tests
+
+The module ships with two integration test classes. They require no external infrastructure
+— everything runs in-process using `MiniDFSCluster`, `MiniYARNCluster`, and `MiniKdc`.
+
+```bash
+# Run all tests (integration + Kerberos)
+mvn test -pl spark-yarn-client
+
+# Run only integration tests
+mvn test -pl spark-yarn-client -Dtest=SparkYarnClientIntegrationTest
+
+# Run only Kerberos tests
+mvn test -pl spark-yarn-client -Dtest=SparkYarnKerberosTest
+```
+
+### What the tests cover
+
+**`SparkYarnClientIntegrationTest`** (10 tests):
+- Submitting a real Spark word-count application (`SimpleSparkApp`) that reads HDFS input,
+  counts words, and writes results back — verifying the full distributed execution path
+  (real ApplicationMaster + executor containers + task scheduling).
+- Verifying the YARN application reaches `FINISHED / SUCCEEDED`.
+- Verifying output files on HDFS contain the expected word counts.
+- Uploading a JAR and reusing it across multiple submissions.
+- Listing running applications.
+- Killing a running application and verifying `KILLED` state.
+- **Java 8 cross-version test**: submits via a Java 21 client configured with
+  `addJava9ModuleOpens(false)` and a Java 8 `javaHome`, then inspects the NodeManager's
+  `launch_container.sh` to assert that `--add-opens` flags are absent from the command.
+
+**`SparkYarnKerberosTest`** (8 tests):
+- `isKerberosEnabled()` logic for all combinations of principal/keytab presence.
+- `KerberosSupport.login()` with real MiniKdc credentials — verifies the returned UGI is
+  backed by a keytab and has the expected principal name.
+- Post-login Hadoop configuration (`hadoop.security.authentication == kerberos`).
+- `buildSparkProperties()` includes `spark.kerberos.principal` and `spark.kerberos.keytab`
+  when Kerberos is configured, and omits them when it is not.
