@@ -171,6 +171,20 @@
       <scope>test</scope>
     </dependency>
 
+    <!-- Real Spark AM and executor classes for integration tests -->
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-core_2.12</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-yarn_2.12</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+
     <!-- Logging for tests -->
     <dependency>
       <groupId>org.apache.logging.log4j</groupId>

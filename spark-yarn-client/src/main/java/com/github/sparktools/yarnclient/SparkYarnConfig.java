@@ -37,6 +37,7 @@ public final class SparkYarnConfig {
     private final String kerberosKeytab;
     private final Configuration hadoopConf;
     private final Map<String, String> extraSparkConf;
+    private final boolean addJava9ModuleOpens;
 
     private SparkYarnConfig(Builder b) {
         this.hdfsUri = b.hdfsUri;
@@ -47,6 +48,7 @@ public final class SparkYarnConfig {
         this.kerberosKeytab = b.kerberosKeytab;
         this.hadoopConf = b.hadoopConf;
         this.extraSparkConf = Collections.unmodifiableMap(new HashMap<>(b.extraSparkConf));
+        this.addJava9ModuleOpens = b.addJava9ModuleOpens;
     }
 
     public String getHdfsUri() { return hdfsUri; }
@@ -58,6 +60,11 @@ public final class SparkYarnConfig {
     public String getKerberosKeytab() { return kerberosKeytab; }
     public Configuration getHadoopConf() { return hadoopConf; }
     public Map<String, String> getExtraSparkConf() { return extraSparkConf; }
+    /**
+     * Whether to inject {@code --add-opens} JVM flags required by Spark on Java 9+.
+     * Set to {@code false} when the YARN cluster runs Java 8.
+     */
+    public boolean isAddJava9ModuleOpens() { return addJava9ModuleOpens; }
 
     public boolean isKerberosEnabled() {
         return kerberosPrincipal != null && !kerberosPrincipal.isEmpty()
@@ -75,6 +82,7 @@ public final class SparkYarnConfig {
         private String kerberosKeytab;
         private Configuration hadoopConf = new Configuration();
         private final Map<String, String> extraSparkConf = new HashMap<>();
+        private boolean addJava9ModuleOpens = true;
 
         /** HDFS namenode URI, e.g. {@code hdfs://namenode:8020}. Required. */
         public Builder hdfsUri(String hdfsUri) {
@@ -136,6 +144,19 @@ public final class SparkYarnConfig {
          */
         public Builder sparkConf(String key, String value) {
             extraSparkConf.put(Objects.requireNonNull(key), Objects.requireNonNull(value));
+            return this;
+        }
+
+        /**
+         * Controls whether {@code --add-opens} JVM flags are injected into the AM and
+         * executor launch commands.  These flags are required by Spark on Java 9+, but
+         * Java 8 does not recognise them and will fail to start.
+         *
+         * <p>Default: {@code true} (suitable for Java 9+ clusters).
+         * Set to {@code false} when submitting to a Java 8 YARN cluster.
+         */
+        public Builder addJava9ModuleOpens(boolean add) {
+            this.addJava9ModuleOpens = add;
             return this;
         }
 

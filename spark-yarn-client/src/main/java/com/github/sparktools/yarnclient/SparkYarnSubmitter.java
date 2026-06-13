@@ -93,7 +93,7 @@ class SparkYarnSubmitter {
         // Spark distribution jars → also determines extra CLASSPATH entries
         List<String> sparkLibCp = resolveSparkLibs(localResources, sparkProps);
 
-        Map<String, String> env = buildContainerEnv(sparkLibCp);
+        Map<String, String> env = buildContainerEnv(sparkLibCp, stagingDir);
         List<String> command    = buildAmCommand(job, hdfsJarUri);
 
         ByteBuffer tokens = config.isKerberosEnabled()
@@ -143,6 +143,13 @@ class SparkYarnSubmitter {
 
         // Forward HDFS / YARN connectivity so the AM finds the same cluster
         forwardHadoopConf(p);
+
+        // On Java 9+, prepend module opens to executor JVM options so executor containers
+        // can also access internal JDK APIs that Spark's storage/network layer requires.
+        if (config.isAddJava9ModuleOpens()) {
+            String opens = String.join(" ", JAVA9_MODULE_OPENS);
+            p.setProperty("spark.executor.extraJavaOptions", opens);
+        }
 
         // Cluster-level extras first, then job-level extras (job wins on conflicts)
         config.getExtraSparkConf().forEach(p::setProperty);
@@ -302,9 +309,11 @@ class SparkYarnSubmitter {
     // Container environment (CLASSPATH etc.)
     // -------------------------------------------------------------------------
 
-    private Map<String, String> buildContainerEnv(List<String> sparkLibCp) {
+    private Map<String, String> buildContainerEnv(List<String> sparkLibCp, Path stagingDir) {
         Map<String, String> env = new LinkedHashMap<>();
         env.put("SPARK_YARN_MODE", "true");
+        // Required by Spark's ApplicationMaster to locate and clean up the staging directory
+        env.put("SPARK_YARN_STAGING_DIR", stagingDir.toUri().toString());
 
         List<String> cp = new ArrayList<>();
 
@@ -345,6 +354,27 @@ class SparkYarnSubmitter {
      *   1><LOG_DIR>/AppMaster.stdout 2><LOG_DIR>/AppMaster.stderr
      * </pre>
      */
+    // --add-opens flags required by Spark on Java 9+. Mirror of Spark's extraJavaTestArgs
+    // in the parent pom. Without these, internal JDK classes used by Spark's storage and
+    // network layers throw IllegalAccessError at runtime.
+    private static final String[] JAVA9_MODULE_OPENS = {
+        "--add-opens=java.base/java.lang=ALL-UNNAMED",
+        "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
+        "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+        "--add-opens=java.base/java.io=ALL-UNNAMED",
+        "--add-opens=java.base/java.net=ALL-UNNAMED",
+        "--add-opens=java.base/java.nio=ALL-UNNAMED",
+        "--add-opens=java.base/java.util=ALL-UNNAMED",
+        "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
+        "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED",
+        "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED",
+        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+        "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED",
+        "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
+        "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",
+        "-Djdk.reflect.useDirectMethodHandle=false",
+    };
+
     private List<String> buildAmCommand(SparkJobConfig job, String hdfsJarUri) {
         List<String> tokens = new ArrayList<>();
 
@@ -359,6 +389,13 @@ class SparkYarnSubmitter {
         tokens.add("-Djava.io.tmpdir=" + Environment.PWD.$$() + "/tmp");
         tokens.add("-Dspark.yarn.app.container.log.dir="
             + ApplicationConstants.LOG_DIR_EXPANSION_VAR);
+
+        // On Java 9+, Spark accesses internal JDK APIs that require explicit module opens.
+        // Controlled by SparkYarnConfig.addJava9ModuleOpens (default true); set false
+        // when targeting Java 8 clusters — Java 8 does not support these flags.
+        if (config.isAddJava9ModuleOpens()) {
+            Collections.addAll(tokens, JAVA9_MODULE_OPENS);
+        }
 
         // Extra JVM opts from job config (e.g. GC flags, agent options)
         String extraOpts = effectiveSparkConf(job, "spark.driver.extraJavaOptions");
