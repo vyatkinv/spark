@@ -185,6 +185,14 @@
       <scope>test</scope>
     </dependency>
 
+    <!-- In-process Kerberos KDC for Kerberos integration tests -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-minikdc</artifactId>
+      <version>${hadoop.version}</version>
+      <scope>test</scope>
+    </dependency>
+
     <!-- Logging for tests -->
     <dependency>
       <groupId>org.apache.logging.log4j</groupId>

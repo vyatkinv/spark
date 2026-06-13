@@ -120,7 +120,8 @@ class SparkYarnSubmitter {
     // Spark properties file (read by ApplicationMaster via --properties-file)
     // -------------------------------------------------------------------------
 
-    private Properties buildSparkProperties(
+    // Package-private for testing (verifying Kerberos property forwarding without a full cluster)
+    Properties buildSparkProperties(
             SparkJobConfig job, String hdfsJarUri, Path stagingDir) {
 
         Properties p = new Properties();
