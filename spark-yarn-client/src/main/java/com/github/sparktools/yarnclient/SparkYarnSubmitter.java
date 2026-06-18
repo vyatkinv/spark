@@ -63,6 +63,7 @@ class SparkYarnSubmitter {
 
     static final String CONF_ARCHIVE_KEY = "__spark_conf__";
     static final String SPARK_LIBS_KEY   = "__spark_libs__";
+    static final String APP_JAR_KEY      = "__app__.jar";
     static final String PROPS_FILENAME   = "__spark_conf__.properties";
     static final String HADOOP_CONF_DIR  = "__hadoop_conf__";
     static final String DIST_CACHE_CONF  = "__spark_dist_cache__.properties";
@@ -127,6 +128,11 @@ class SparkYarnSubmitter {
 
         Path confArchive = uploadConfArchive(stagingDir, sparkProps, distCacheProps);
         localResources.put(CONF_ARCHIVE_KEY, archiveResource(confArchive));
+
+        // Register the app JAR as a LocalResource so it's available in the container
+        FileStatus appJarStat = hdfs.getFileStatus(new Path(hdfsJarUri));
+        localResources.put(APP_JAR_KEY,
+                buildResource(appJarStat, LocalResourceType.FILE));
 
         List<String> sparkLibCp = resolveSparkLibs(localResources, sparkProps);
 
@@ -444,6 +450,12 @@ class SparkYarnSubmitter {
     /**
      * Registers Spark distribution jars as LocalResources and returns the list
      * of classpath entries to add to the AM container's CLASSPATH.
+     *
+     * <p>When neither {@code spark.yarn.archive} nor {@code spark.yarn.jars} is set,
+     * falls back to <b>fat JAR mode</b>: the application JAR (already registered as
+     * {@code __app__.jar}) is assumed to contain all Spark runtime classes and is
+     * added to the container classpath.  This avoids pre-staging Spark jars on HDFS
+     * at the cost of a larger per-submission upload.
      */
     private List<String> resolveSparkLibs(
             Map<String, LocalResource> localResources, Properties sparkProps) throws IOException {
@@ -456,9 +468,10 @@ class SparkYarnSubmitter {
         } else if (jars != null) {
             return resolveFromJarsGlob(localResources, jars);
         } else {
-            log.warn("Neither spark.yarn.archive nor spark.yarn.jars is set. "
-                + "The ApplicationMaster container may not have Spark classes on its classpath.");
-            return Collections.emptyList();
+            log.info("Neither spark.yarn.archive nor spark.yarn.jars is set — "
+                + "using fat JAR mode (Spark classes expected inside the application JAR)");
+            return Collections.singletonList(
+                    Environment.PWD.$$() + "/" + APP_JAR_KEY);
         }
     }
 
