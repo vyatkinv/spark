@@ -141,6 +141,11 @@ class SparkYarnKerberosTest {
      * {@code spark.kerberos.principal} and {@code spark.kerberos.keytab} when
      * the config has Kerberos enabled.
      *
+     * <p>{@code buildSparkProperties} initially sets the keytab to the local
+     * filesystem path.  During submission, {@code distributeKeytab} uploads the
+     * keytab to HDFS and rewrites the property to just the filename — see
+     * {@code SparkYarnClientIntegrationTest.distributeKeytab_uploadsAndRewritesProperty}.
+     *
      * <p>Uses {@link SparkYarnSubmitter} directly (package-private) with null FileSystem
      * and YarnClient — {@code buildSparkProperties} does not use those fields.
      */

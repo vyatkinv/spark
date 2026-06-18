@@ -24,6 +24,7 @@ import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Properties;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
@@ -438,10 +439,61 @@ class SparkYarnClientIntegrationTest {
         }
     }
 
+    // ── Keytab distribution test ────────────────────────────────────────────
+
+    /**
+     * Verifies that {@link SparkYarnSubmitter#distributeKeytab} uploads the keytab
+     * to the HDFS staging directory, registers it as a {@link org.apache.hadoop.yarn.api.records.LocalResource},
+     * and rewrites {@code spark.kerberos.keytab} to the localized filename.
+     */
+    @Test
+    @Order(10)
+    void distributeKeytab_uploadsAndRewritesProperty() throws Exception {
+        // Create a temp file simulating a keytab
+        java.nio.file.Path fakeKeytab = tempDir.resolve("spark-test.keytab");
+        Files.write(fakeKeytab, "fake-keytab-bytes".getBytes(StandardCharsets.UTF_8));
+
+        SparkYarnConfig krbConfig = SparkYarnConfig.builder()
+                .hdfsUri(hdfsUri)
+                .hadoopConf(conf)
+                .kerberos("spark/host@REALM", fakeKeytab.toAbsolutePath().toString())
+                .build();
+
+        FileSystem fs = FileSystem.newInstance(URI.create(hdfsUri), conf);
+        try {
+            SparkYarnSubmitter submitter = new SparkYarnSubmitter(krbConfig, fs, null);
+
+            Path stagingDir = new Path(hdfsUri + "/.sparkStaging/keytab-test");
+            fs.mkdirs(stagingDir);
+
+            Properties props = new Properties();
+            props.setProperty("spark.kerberos.keytab", fakeKeytab.toAbsolutePath().toString());
+
+            Map<String, org.apache.hadoop.yarn.api.records.LocalResource> localResources =
+                    new LinkedHashMap<>();
+
+            submitter.distributeKeytab(stagingDir, props, localResources);
+
+            // Property must be rewritten to just the filename
+            assertEquals("spark-test.keytab", props.getProperty("spark.kerberos.keytab"),
+                    "spark.kerberos.keytab must be rewritten to the localized filename");
+
+            // LocalResource must be registered under the filename key
+            assertTrue(localResources.containsKey("spark-test.keytab"),
+                    "keytab must be registered as a LocalResource");
+
+            // File must exist on HDFS
+            assertTrue(fs.exists(new Path(stagingDir, "spark-test.keytab")),
+                    "keytab must be uploaded to the HDFS staging directory");
+        } finally {
+            fs.close();
+        }
+    }
+
     // ── SparkYarnSubmitter unit tests ────────────────────────────────────────
 
     @Test
-    @Order(10)
+    @Order(11)
     void memoryParser_parsesVariousFormats() {
         assertEquals(1024, SparkYarnSubmitter.MemoryParser.toMb("1g"));
         assertEquals(512,  SparkYarnSubmitter.MemoryParser.toMb("512m"));

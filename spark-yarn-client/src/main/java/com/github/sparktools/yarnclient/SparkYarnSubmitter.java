@@ -87,6 +87,13 @@ class SparkYarnSubmitter {
 
         // YARN local resources that the NM downloads into the container
         Map<String, LocalResource> localResources = new LinkedHashMap<>();
+
+        // Keytab must be distributed before conf archive upload — the archive
+        // must contain the container-relative keytab path, not the local one.
+        if (config.isKerberosEnabled()) {
+            distributeKeytab(stagingDir, sparkProps, localResources);
+        }
+
         Path confArchive = uploadConfArchive(stagingDir, sparkProps);
         localResources.put(CONF_ARCHIVE_KEY, archiveResource(confArchive));
 
@@ -424,6 +431,36 @@ class SparkYarnSubmitter {
         String command = String.join(" ", tokens);
         log.debug("AM command: {}", command);
         return Collections.singletonList(command);
+    }
+
+    // -------------------------------------------------------------------------
+    // Kerberos keytab distribution
+    // -------------------------------------------------------------------------
+
+    /**
+     * Uploads the Kerberos keytab to the HDFS staging directory and registers it
+     * as a {@link LocalResource} so YARN's NodeManager downloads it into the AM
+     * container.  Rewrites {@code spark.kerberos.keytab} in {@code sparkProps}
+     * to the localized filename (the file lands in the container's working directory).
+     *
+     * <p>Without this step the AM would reference a local filesystem path that
+     * does not exist inside the container and would be unable to re-login from
+     * the keytab for long-running jobs.
+     */
+    // Package-private for testing
+    void distributeKeytab(Path stagingDir, Properties sparkProps,
+            Map<String, LocalResource> localResources) throws IOException {
+        String keytabPath = config.getKerberosKeytab();
+        Path src = new Path(keytabPath);
+        String keytabName = src.getName();
+        Path dest = new Path(stagingDir, keytabName);
+
+        hdfs.copyFromLocalFile(false, true, src, dest);
+        localResources.put(keytabName,
+                buildResource(hdfs.getFileStatus(dest), LocalResourceType.FILE));
+
+        sparkProps.setProperty("spark.kerberos.keytab", keytabName);
+        log.info("Distributed keytab to {} (localized as {})", dest, keytabName);
     }
 
     // -------------------------------------------------------------------------
