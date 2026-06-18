@@ -1,5 +1,6 @@
 package com.github.sparktools.yarnclient;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -12,7 +13,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.net.URI;
 import java.security.PrivilegedExceptionAction;
 import java.util.Collections;
 import java.util.EnumSet;
@@ -28,11 +28,8 @@ import java.util.stream.Collectors;
  *
  * <p>Typical usage:
  * <pre>{@code
- * SparkYarnConfig config = SparkYarnConfig.builder()
- *     .hdfsUri("hdfs://namenode:8020")
- *     .sparkConf("spark.yarn.jars", "hdfs:///spark/jars/*.jar")
- *     .kerberos("svc-spark@CORP.COM", "/etc/keytabs/spark.keytab")
- *     .build();
+ * // Minimal — reads fs.defaultFS and YARN RM from HADOOP_CONF_DIR:
+ * SparkYarnConfig config = SparkYarnConfig.builder().build();
  *
  * SparkJobConfig job = SparkJobConfig.builder()
  *     .appName("MyJob")
@@ -69,9 +66,13 @@ public class SparkYarnClient implements Closeable {
                 config.getKerberosKeytab());
         }
 
+        Configuration hadoopConf = config.getHadoopConf();
+        if (config.getHdfsUri() != null) {
+            hadoopConf.set("fs.defaultFS", config.getHdfsUri());
+        }
         // newInstance() creates an independent (non-cached) FileSystem so that
         // closing this client does not affect other FileSystem users in the JVM.
-        this.hdfs = FileSystem.newInstance(URI.create(config.getHdfsUri()), config.getHadoopConf());
+        this.hdfs = FileSystem.newInstance(hadoopConf);
 
         this.yarnClient = YarnClient.createYarnClient();
         yarnClient.init(config.getHadoopConf());
@@ -143,7 +144,7 @@ public class SparkYarnClient implements Closeable {
     private Path resolveJarUploadDir() throws IOException {
         String explicit = config.getHdfsJarUploadDir();
         if (explicit != null) {
-            return new Path(config.getHdfsUri() + explicit);
+            return hdfs.makeQualified(new Path(explicit));
         }
         return new Path(hdfs.getHomeDirectory(), ".spark-uploads");
     }

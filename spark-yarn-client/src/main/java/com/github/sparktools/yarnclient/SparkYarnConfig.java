@@ -15,6 +15,13 @@ import java.util.Objects;
  * {@code spark.yarn.archive} (set through {@link Builder#sparkConf}).
  *
  * <p>Example:
+ * <p>Minimal example (picks up {@code fs.defaultFS} and YARN RM address from
+ * {@code HADOOP_CONF_DIR} automatically):
+ * <pre>{@code
+ * SparkYarnConfig config = SparkYarnConfig.builder().build();
+ * }</pre>
+ *
+ * <p>Explicit example:
  * <pre>{@code
  * SparkYarnConfig config = SparkYarnConfig.builder()
  *     .hdfsUri("hdfs://namenode:8020")
@@ -51,6 +58,10 @@ public final class SparkYarnConfig {
         this.addJava9ModuleOpens = b.addJava9ModuleOpens;
     }
 
+    /**
+     * Explicit HDFS URI override, or {@code null} to use {@code fs.defaultFS}
+     * from the Hadoop configuration.
+     */
     public String getHdfsUri() { return hdfsUri; }
     /** Explicit HDFS directory for JAR uploads, or {@code null} for auto (home dir). */
     public String getHdfsJarUploadDir() { return hdfsJarUploadDir; }
@@ -85,7 +96,11 @@ public final class SparkYarnConfig {
         private final Map<String, String> extraSparkConf = new HashMap<>();
         private boolean addJava9ModuleOpens = true;
 
-        /** HDFS namenode URI, e.g. {@code hdfs://namenode:8020}. Required. */
+        /**
+         * Override the HDFS namenode URI, e.g. {@code hdfs://namenode:8020}.
+         * If not set, uses {@code fs.defaultFS} from the Hadoop configuration
+         * (loaded from {@code core-site.xml} in {@code HADOOP_CONF_DIR}).
+         */
         public Builder hdfsUri(String hdfsUri) {
             this.hdfsUri = Objects.requireNonNull(hdfsUri);
             return this;
@@ -166,7 +181,6 @@ public final class SparkYarnConfig {
         }
 
         public SparkYarnConfig build() {
-            Objects.requireNonNull(hdfsUri, "hdfsUri is required");
             return new SparkYarnConfig(this);
         }
     }
