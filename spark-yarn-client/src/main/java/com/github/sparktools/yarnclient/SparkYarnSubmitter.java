@@ -1,12 +1,17 @@
 package com.github.sparktools.yarnclient;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.io.DataOutputBuffer;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.MRJobConfig;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.yarn.api.ApplicationConstants;
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
 import org.apache.hadoop.yarn.api.records.*;
@@ -30,15 +35,18 @@ import java.util.zip.ZipOutputStream;
  *
  * <h3>What this class does (mirroring Spark's {@code Client.scala})</h3>
  * <ol>
- *   <li>Creates a per-submission staging directory in HDFS:
- *       {@code <fs.defaultFS>/.sparkStaging/<appId>/}</li>
+ *   <li>Creates a per-submission staging directory in HDFS with {@code 700} permissions.</li>
  *   <li>Builds and uploads {@code __spark_conf__.zip} containing the serialised
- *       {@link Properties} file that the Spark ApplicationMaster reads on startup.</li>
+ *       {@link Properties} file, Hadoop XML configs from {@code HADOOP_CONF_DIR} /
+ *       {@code YARN_CONF_DIR}, and distributed cache configuration.</li>
  *   <li>Resolves Spark distribution jars from {@code spark.yarn.jars} (HDFS glob) or
  *       {@code spark.yarn.archive} (single archive) and registers them as YARN
  *       {@link LocalResource}s so the NodeManager downloads them into the container.</li>
- *   <li>Constructs the YARN container classpath and the AM launch command.</li>
- *   <li>Submits the application via {@link YarnClient#submitApplication}.</li>
+ *   <li>Distributes user-specified files, archives, and jars via {@code spark.yarn.dist.*}.</li>
+ *   <li>Obtains delegation tokens for HDFS, YARN RM, and any configured services.</li>
+ *   <li>Constructs the YARN container classpath (including {@code mapreduce.application.classpath}),
+ *       environment, and the AM launch command.</li>
+ *   <li>Sets memory overhead, ACLs, and submits via {@link YarnClient#submitApplication}.</li>
  * </ol>
  *
  * <h3>Prerequisites</h3>
@@ -56,6 +64,16 @@ class SparkYarnSubmitter {
     static final String CONF_ARCHIVE_KEY = "__spark_conf__";
     static final String SPARK_LIBS_KEY   = "__spark_libs__";
     static final String PROPS_FILENAME   = "__spark_conf__.properties";
+    static final String HADOOP_CONF_DIR  = "__hadoop_conf__";
+    static final String DIST_CACHE_CONF  = "__spark_dist_cache__.properties";
+
+    static final FsPermission STAGING_DIR_PERMISSION =
+            FsPermission.createImmutable((short) 0700);
+    static final FsPermission APP_FILE_PERMISSION =
+            FsPermission.createImmutable((short) 0644);
+
+    static final int MEMORY_OVERHEAD_MIN_MB = 384;
+    static final double MEMORY_OVERHEAD_FACTOR = 0.10;
 
     private final SparkYarnConfig config;
     private final FileSystem hdfs;
@@ -79,13 +97,22 @@ class SparkYarnSubmitter {
         Path stagingDir = new Path(
             config.getHadoopConf().get("fs.defaultFS", config.getHdfsUri())
             + "/.sparkStaging/" + appId);
-        hdfs.mkdirs(stagingDir);
+        FileSystem.mkdirs(hdfs, stagingDir, STAGING_DIR_PERMISSION);
         log.debug("Staging directory: {}", stagingDir);
 
-        // Effective Spark properties — AM reads these from the conf archive
+        try {
+            return doSubmit(app, appId, job, hdfsJarUri, stagingDir);
+        } catch (Exception e) {
+            cleanupStagingDir(stagingDir);
+            throw e;
+        }
+    }
+
+    private ApplicationId doSubmit(YarnClientApplication app, ApplicationId appId,
+            SparkJobConfig job, String hdfsJarUri, Path stagingDir) throws Exception {
+
         Properties sparkProps = buildSparkProperties(job, hdfsJarUri, stagingDir);
 
-        // YARN local resources that the NM downloads into the container
         Map<String, LocalResource> localResources = new LinkedHashMap<>();
 
         // Keytab must be distributed before conf archive upload — the archive
@@ -94,10 +121,13 @@ class SparkYarnSubmitter {
             distributeKeytab(stagingDir, sparkProps, localResources);
         }
 
-        Path confArchive = uploadConfArchive(stagingDir, sparkProps);
+        // Distribute user-specified files, archives, and jars
+        Properties distCacheProps = distributeUserResources(
+                job, stagingDir, sparkProps, localResources);
+
+        Path confArchive = uploadConfArchive(stagingDir, sparkProps, distCacheProps);
         localResources.put(CONF_ARCHIVE_KEY, archiveResource(confArchive));
 
-        // Spark distribution jars → also determines extra CLASSPATH entries
         List<String> sparkLibCp = resolveSparkLibs(localResources, sparkProps);
 
         Map<String, String> env = buildContainerEnv(sparkLibCp, stagingDir);
@@ -109,13 +139,26 @@ class SparkYarnSubmitter {
         ContainerLaunchContext amContainer = ContainerLaunchContext.newInstance(
             localResources, env, command, null, tokens, null);
 
+        // ACLs: view and modify permissions
+        Map<ApplicationAccessType, String> acls = new HashMap<>();
+        String currentUser = UserGroupInformation.getCurrentUser().getShortUserName();
+        acls.put(ApplicationAccessType.VIEW_APP, currentUser);
+        acls.put(ApplicationAccessType.MODIFY_APP, currentUser);
+        amContainer.setApplicationACLs(acls);
+
+        // Memory overhead: max(driverMemory * factor, 384MB)
+        int driverMb = MemoryParser.toMb(job.getDriverMemory());
+        int overhead = Math.max((int) (driverMb * MEMORY_OVERHEAD_FACTOR), MEMORY_OVERHEAD_MIN_MB);
+        int totalAmMemory = driverMb + overhead;
+        log.debug("AM memory: {}MB (driver) + {}MB (overhead) = {}MB",
+                driverMb, overhead, totalAmMemory);
+
         ApplicationSubmissionContext ctx = app.getApplicationSubmissionContext();
         ctx.setApplicationName(job.getAppName());
         ctx.setApplicationType("SPARK");
         ctx.setQueue(job.getQueue());
         ctx.setAMContainerSpec(amContainer);
-        ctx.setResource(Resource.newInstance(
-            MemoryParser.toMb(job.getDriverMemory()), job.getDriverCores()));
+        ctx.setResource(Resource.newInstance(totalAmMemory, job.getDriverCores()));
         ctx.setMaxAppAttempts(2);
 
         yarnClient.submitApplication(ctx);
@@ -124,10 +167,24 @@ class SparkYarnSubmitter {
     }
 
     // -------------------------------------------------------------------------
+    // Staging directory cleanup
+    // -------------------------------------------------------------------------
+
+    private void cleanupStagingDir(Path stagingDir) {
+        try {
+            if (hdfs.delete(stagingDir, true)) {
+                log.info("Cleaned up staging directory {}", stagingDir);
+            }
+        } catch (IOException e) {
+            log.warn("Failed to clean up staging directory {}", stagingDir, e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Spark properties file (read by ApplicationMaster via --properties-file)
     // -------------------------------------------------------------------------
 
-    // Package-private for testing (verifying Kerberos property forwarding without a full cluster)
+    // Package-private for testing
     Properties buildSparkProperties(
             SparkJobConfig job, String hdfsJarUri, Path stagingDir) {
 
@@ -199,14 +256,116 @@ class SparkYarnSubmitter {
     }
 
     // -------------------------------------------------------------------------
+    // User resource distribution (--files, --archives, --jars)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Distributes user-specified files, archives, and jars to the HDFS staging
+     * directory, registers them as {@link LocalResource}s, and sets the
+     * corresponding {@code spark.yarn.dist.*} properties so the AM can
+     * propagate them to executor containers.
+     *
+     * @return distributed cache properties for inclusion in the conf archive
+     */
+    private Properties distributeUserResources(SparkJobConfig job, Path stagingDir,
+            Properties sparkProps, Map<String, LocalResource> localResources) throws IOException {
+
+        Properties distCacheProps = new Properties();
+        List<String> distFiles = new ArrayList<>();
+        List<String> distArchives = new ArrayList<>();
+        List<String> distJars = new ArrayList<>();
+
+        for (String filePath : job.getFiles()) {
+            Path uploaded = stageFile(stagingDir, filePath);
+            String name = uploaded.getName();
+            localResources.put(name,
+                    buildResource(hdfs.getFileStatus(uploaded), LocalResourceType.FILE));
+            distFiles.add(uploaded.toUri().toString());
+        }
+
+        for (String archivePath : job.getArchives()) {
+            Path uploaded = stageFile(stagingDir, archivePath);
+            String name = uploaded.getName();
+            localResources.put(name,
+                    buildResource(hdfs.getFileStatus(uploaded), LocalResourceType.ARCHIVE));
+            distArchives.add(uploaded.toUri().toString());
+        }
+
+        for (String jarPath : job.getJars()) {
+            Path uploaded = stageFile(stagingDir, jarPath);
+            String name = uploaded.getName();
+            localResources.put(name,
+                    buildResource(hdfs.getFileStatus(uploaded), LocalResourceType.FILE));
+            distJars.add(uploaded.toUri().toString());
+        }
+
+        if (!distFiles.isEmpty()) {
+            sparkProps.setProperty("spark.yarn.dist.files", String.join(",", distFiles));
+        }
+        if (!distArchives.isEmpty()) {
+            sparkProps.setProperty("spark.yarn.dist.archives", String.join(",", distArchives));
+        }
+        if (!distJars.isEmpty()) {
+            sparkProps.setProperty("spark.yarn.dist.jars", String.join(",", distJars));
+        }
+
+        // Build dist cache properties that the AM reads via --dist-cache-conf
+        int idx = 0;
+        for (String uri : distFiles) {
+            distCacheProps.setProperty("spark.yarn.cache.filenames." + idx, uri);
+            distCacheProps.setProperty("spark.yarn.cache.types." + idx, "FILE");
+            distCacheProps.setProperty("spark.yarn.cache.visibilities." + idx, "APPLICATION");
+            idx++;
+        }
+        for (String uri : distArchives) {
+            distCacheProps.setProperty("spark.yarn.cache.filenames." + idx, uri);
+            distCacheProps.setProperty("spark.yarn.cache.types." + idx, "ARCHIVE");
+            distCacheProps.setProperty("spark.yarn.cache.visibilities." + idx, "APPLICATION");
+            idx++;
+        }
+        for (String uri : distJars) {
+            distCacheProps.setProperty("spark.yarn.cache.filenames." + idx, uri);
+            distCacheProps.setProperty("spark.yarn.cache.types." + idx, "FILE");
+            distCacheProps.setProperty("spark.yarn.cache.visibilities." + idx, "APPLICATION");
+            idx++;
+        }
+        if (idx > 0) {
+            distCacheProps.setProperty("spark.yarn.cache.size", String.valueOf(idx));
+        }
+
+        return distCacheProps;
+    }
+
+    /**
+     * Stages a file to the HDFS staging directory. If the path is already on HDFS,
+     * it is used as-is. Local paths are uploaded.
+     */
+    private Path stageFile(Path stagingDir, String filePath) throws IOException {
+        Path src = new Path(filePath);
+        String scheme = src.toUri().getScheme();
+        if (scheme != null && (scheme.equals("hdfs") || scheme.equals("s3a")
+                || scheme.equals("gs") || scheme.equals("wasbs"))) {
+            return src;
+        }
+        Path dest = new Path(stagingDir, src.getName());
+        hdfs.copyFromLocalFile(false, true, src, dest);
+        hdfs.setPermission(dest, APP_FILE_PERMISSION);
+        log.debug("Staged {} → {}", filePath, dest);
+        return dest;
+    }
+
+    // -------------------------------------------------------------------------
     // Conf archive (__spark_conf__.zip → localized to {{PWD}}/__spark_conf__/)
     // -------------------------------------------------------------------------
 
-    private Path uploadConfArchive(Path stagingDir, Properties sparkProps) throws IOException {
+    private Path uploadConfArchive(Path stagingDir, Properties sparkProps,
+            Properties distCacheProps) throws IOException {
         Path dest = new Path(stagingDir, CONF_ARCHIVE_KEY + ".zip");
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            zos.setLevel(0);
+
             // Spark properties — AM reads these via --properties-file
             zos.putNextEntry(new ZipEntry(PROPS_FILENAME));
             StringWriter sw = new StringWriter();
@@ -214,12 +373,22 @@ class SparkYarnSubmitter {
             zos.write(sw.toString().getBytes(StandardCharsets.UTF_8));
             zos.closeEntry();
 
-            // Hadoop config as yarn-site.xml inside the archive.
-            // After YARN extraction this lands at {{PWD}}/__spark_conf__/yarn-site.xml,
-            // which is already on the container CLASSPATH. This lets new Configuration()
-            // inside the AM pick up the YARN RM address, HDFS URI etc. without relying
-            // on HADOOP_CONF_DIR — mirroring what Spark's Client.scala does.
-            zos.putNextEntry(new ZipEntry("yarn-site.xml"));
+            // Distributed cache config — AM reads via --dist-cache-conf
+            if (!distCacheProps.isEmpty()) {
+                zos.putNextEntry(new ZipEntry(DIST_CACHE_CONF));
+                StringWriter dw = new StringWriter();
+                distCacheProps.store(dw, null);
+                zos.write(dw.toString().getBytes(StandardCharsets.UTF_8));
+                zos.closeEntry();
+            }
+
+            // Hadoop config files from HADOOP_CONF_DIR / YARN_CONF_DIR
+            zos.putNextEntry(new ZipEntry(HADOOP_CONF_DIR + "/"));
+            zos.closeEntry();
+            addHadoopConfFiles(zos);
+
+            // Programmatic Hadoop config as __spark_hadoop_conf__.xml
+            zos.putNextEntry(new ZipEntry("__spark_hadoop_conf__.xml"));
             config.getHadoopConf().writeXml(zos);
             zos.closeEntry();
         }
@@ -227,8 +396,45 @@ class SparkYarnSubmitter {
         try (FSDataOutputStream out = hdfs.create(dest, true)) {
             out.write(baos.toByteArray());
         }
+        hdfs.setPermission(dest, APP_FILE_PERMISSION);
         log.debug("Uploaded conf archive to {}", dest);
         return dest;
+    }
+
+    /**
+     * Adds XML config files from {@code HADOOP_CONF_DIR} and {@code YARN_CONF_DIR}
+     * into the {@code __hadoop_conf__/} subdirectory of the conf archive.
+     */
+    private void addHadoopConfFiles(ZipOutputStream zos) throws IOException {
+        Map<String, File> confFiles = new LinkedHashMap<>();
+
+        for (String envKey : new String[]{"HADOOP_CONF_DIR", "YARN_CONF_DIR"}) {
+            String dir = System.getenv(envKey);
+            if (dir == null) continue;
+            File dirFile = new File(dir);
+            if (!dirFile.isDirectory()) continue;
+
+            File[] files = dirFile.listFiles();
+            if (files == null) continue;
+            for (File f : files) {
+                if (f.isFile() && !confFiles.containsKey(f.getName())) {
+                    confFiles.put(f.getName(), f);
+                }
+            }
+        }
+
+        for (Map.Entry<String, File> entry : confFiles.entrySet()) {
+            File f = entry.getValue();
+            if (!f.canRead()) continue;
+            zos.putNextEntry(new ZipEntry(HADOOP_CONF_DIR + "/" + entry.getKey()));
+            java.nio.file.Files.copy(f.toPath(), zos);
+            zos.closeEntry();
+        }
+
+        if (!confFiles.isEmpty()) {
+            log.debug("Added {} Hadoop config files from HADOOP_CONF_DIR/YARN_CONF_DIR",
+                    confFiles.size());
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -288,12 +494,10 @@ class SparkYarnSubmitter {
             if (entry.isEmpty()) continue;
 
             if (entry.startsWith("local:")) {
-                // Pre-installed on every node — no staging needed, just add to CP
                 classpathEntries.add(entry.substring("local:".length()));
                 continue;
             }
 
-            // HDFS path (possibly a glob)
             FileStatus[] matches = hdfs.globStatus(new Path(entry));
             if (matches == null || matches.length == 0) {
                 log.warn("spark.yarn.jars pattern matched no files: {}", entry);
@@ -301,7 +505,6 @@ class SparkYarnSubmitter {
             }
             for (FileStatus stat : matches) {
                 String key = stat.getPath().getName();
-                // Guard against duplicate filenames from multiple globs
                 if (!localResources.containsKey(key)) {
                     localResources.put(key, buildResource(stat, LocalResourceType.FILE));
                 }
@@ -314,14 +517,20 @@ class SparkYarnSubmitter {
     }
 
     // -------------------------------------------------------------------------
-    // Container environment (CLASSPATH etc.)
+    // Container environment (CLASSPATH, SPARK_USER, etc.)
     // -------------------------------------------------------------------------
 
     private Map<String, String> buildContainerEnv(List<String> sparkLibCp, Path stagingDir) {
         Map<String, String> env = new LinkedHashMap<>();
         env.put("SPARK_YARN_MODE", "true");
-        // Required by Spark's ApplicationMaster to locate and clean up the staging directory
         env.put("SPARK_YARN_STAGING_DIR", stagingDir.toUri().toString());
+
+        // SPARK_USER — used by Spark internals for security context and web UI ACLs
+        try {
+            env.put("SPARK_USER", UserGroupInformation.getCurrentUser().getShortUserName());
+        } catch (IOException e) {
+            log.debug("Could not determine current user for SPARK_USER", e);
+        }
 
         List<String> cp = new ArrayList<>();
 
@@ -331,10 +540,20 @@ class SparkYarnSubmitter {
             YarnConfiguration.DEFAULT_YARN_APPLICATION_CLASSPATH);
         cp.addAll(Arrays.asList(yarnCp));
 
-        // Container working directory (catches any stray jars placed at root)
+        // MapReduce application classpath (some distros put essential jars here)
+        String[] mrCp = config.getHadoopConf().getStrings(
+            MRJobConfig.MAPREDUCE_APPLICATION_CLASSPATH,
+            MRJobConfig.DEFAULT_MAPREDUCE_APPLICATION_CLASSPATH);
+        if (mrCp != null) {
+            cp.addAll(Arrays.asList(mrCp));
+        }
+
+        // Container working directory
         cp.add(Environment.PWD.$$());
         // Extracted Spark conf archive
         cp.add(Environment.PWD.$$() + "/" + CONF_ARCHIVE_KEY);
+        // Hadoop conf subdirectory inside the conf archive
+        cp.add(Environment.PWD.$$() + "/" + CONF_ARCHIVE_KEY + "/" + HADOOP_CONF_DIR);
         // Spark lib jars (from archive or individual files)
         cp.addAll(sparkLibCp);
 
@@ -346,25 +565,7 @@ class SparkYarnSubmitter {
     // ApplicationMaster launch command
     // -------------------------------------------------------------------------
 
-    /**
-     * Builds the shell command string that YARN uses to launch the AM container.
-     *
-     * <p>The command matches what Spark's {@code Client.scala} generates:
-     * <pre>
-     * $JAVA_HOME/bin/java -server -Xmx{driverMem}m
-     *   -Djava.io.tmpdir={{PWD}}/tmp
-     *   -Dspark.yarn.app.container.log.dir=<LOG_DIR>
-     *   org.apache.spark.deploy.yarn.ApplicationMaster
-     *   --class com.example.MyApp
-     *   --jar hdfs://.../__spark_apps__/my-app.jar
-     *   --properties-file {{PWD}}/__spark_conf__/__spark_conf__.properties
-     *   [--arg arg1 --arg arg2 ...]
-     *   1><LOG_DIR>/AppMaster.stdout 2><LOG_DIR>/AppMaster.stderr
-     * </pre>
-     */
-    // --add-opens flags required by Spark on Java 9+. Mirror of Spark's extraJavaTestArgs
-    // in the parent pom. Without these, internal JDK classes used by Spark's storage and
-    // network layers throw IllegalAccessError at runtime.
+    // --add-opens flags required by Spark on Java 9+
     private static final String[] JAVA9_MODULE_OPENS = {
         "--add-opens=java.base/java.lang=ALL-UNNAMED",
         "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
@@ -386,7 +587,6 @@ class SparkYarnSubmitter {
     private List<String> buildAmCommand(SparkJobConfig job, String hdfsJarUri) {
         List<String> tokens = new ArrayList<>();
 
-        // Java executable
         String javaExec = config.getJavaHome() != null
             ? config.getJavaHome() + "/bin/java"
             : Environment.JAVA_HOME.$$() + "/bin/java";
@@ -398,36 +598,31 @@ class SparkYarnSubmitter {
         tokens.add("-Dspark.yarn.app.container.log.dir="
             + ApplicationConstants.LOG_DIR_EXPANSION_VAR);
 
-        // On Java 9+, Spark accesses internal JDK APIs that require explicit module opens.
-        // Controlled by SparkYarnConfig.addJava9ModuleOpens (default true); set false
-        // when targeting Java 8 clusters — Java 8 does not support these flags.
         if (config.isAddJava9ModuleOpens()) {
             Collections.addAll(tokens, JAVA9_MODULE_OPENS);
         }
 
-        // Extra JVM opts from job config (e.g. GC flags, agent options)
         String extraOpts = effectiveSparkConf(job, "spark.driver.extraJavaOptions");
         if (extraOpts != null && !extraOpts.isEmpty()) {
             Collections.addAll(tokens, extraOpts.trim().split("\\s+"));
         }
 
-        // ApplicationMaster main class (Spark's or test override)
         tokens.add(config.getAmClass());
 
-        // AM arguments parsed by Spark's ApplicationMaster.parseArgs()
         tokens.add("--class"); tokens.add(job.getMainClass());
         tokens.add("--jar");   tokens.add(hdfsJarUri);
         tokens.add("--properties-file");
         tokens.add(Environment.PWD.$$() + "/" + CONF_ARCHIVE_KEY + "/" + PROPS_FILENAME);
+        tokens.add("--dist-cache-conf");
+        tokens.add(Environment.PWD.$$() + "/" + CONF_ARCHIVE_KEY + "/" + DIST_CACHE_CONF);
 
         for (String arg : job.getAppArgs()) {
             tokens.add("--arg"); tokens.add(shellEscape(arg));
         }
 
-        tokens.add("1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/AppMaster.stdout");
-        tokens.add("2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/AppMaster.stderr");
+        tokens.add("1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout");
+        tokens.add("2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr");
 
-        // YARN expects a single-element list where the element is the full command string
         String command = String.join(" ", tokens);
         log.debug("AM command: {}", command);
         return Collections.singletonList(command);
@@ -437,16 +632,6 @@ class SparkYarnSubmitter {
     // Kerberos keytab distribution
     // -------------------------------------------------------------------------
 
-    /**
-     * Uploads the Kerberos keytab to the HDFS staging directory and registers it
-     * as a {@link LocalResource} so YARN's NodeManager downloads it into the AM
-     * container.  Rewrites {@code spark.kerberos.keytab} in {@code sparkProps}
-     * to the localized filename (the file lands in the container's working directory).
-     *
-     * <p>Without this step the AM would reference a local filesystem path that
-     * does not exist inside the container and would be unable to re-login from
-     * the keytab for long-running jobs.
-     */
     // Package-private for testing
     void distributeKeytab(Path stagingDir, Properties sparkProps,
             Map<String, LocalResource> localResources) throws IOException {
@@ -456,6 +641,7 @@ class SparkYarnSubmitter {
         Path dest = new Path(stagingDir, keytabName);
 
         hdfs.copyFromLocalFile(false, true, src, dest);
+        hdfs.setPermission(dest, APP_FILE_PERMISSION);
         localResources.put(keytabName,
                 buildResource(hdfs.getFileStatus(dest), LocalResourceType.FILE));
 
@@ -469,11 +655,29 @@ class SparkYarnSubmitter {
 
     private ByteBuffer obtainDelegationTokens() throws Exception {
         Credentials creds = new Credentials();
+
         // HDFS delegation token
         hdfs.addDelegationTokens(config.getKerberosPrincipal(), creds);
-        // RM delegation token
-        yarnClient.getRMDelegationToken(
-            new org.apache.hadoop.io.Text(config.getKerberosPrincipal()));
+
+        // RM delegation token — YarnClient returns a YARN Token that must be
+        // converted to a Hadoop security Token before adding to Credentials
+        org.apache.hadoop.yarn.api.records.Token rmYarnToken =
+                yarnClient.getRMDelegationToken(new Text(config.getKerberosPrincipal()));
+        if (rmYarnToken != null) {
+            org.apache.hadoop.security.token.Token<? extends
+                    org.apache.hadoop.security.token.TokenIdentifier> rmToken =
+                    org.apache.hadoop.yarn.util.ConverterUtils.convertFromYarn(
+                            rmYarnToken, new Text(rmYarnToken.getService()));
+            creds.addToken(rmToken.getService(), rmToken);
+            log.debug("Obtained RM delegation token: {}", rmToken.getService());
+        }
+
+        // Tokens from the current user's credentials (e.g. Hive, HBase tokens
+        // that were obtained during login or via external tooling)
+        Credentials userCreds = UserGroupInformation.getCurrentUser().getCredentials();
+        creds.addAll(userCreds);
+
+        log.info("Obtained {} delegation tokens", creds.numberOfTokens());
 
         DataOutputBuffer dob = new DataOutputBuffer();
         creds.writeTokenStorageToStream(dob);
@@ -502,13 +706,11 @@ class SparkYarnSubmitter {
     // Misc helpers
     // -------------------------------------------------------------------------
 
-    /** Returns the effective value of a Spark conf key: job-level overrides cluster-level. */
     private String effectiveSparkConf(SparkJobConfig job, String key) {
         String v = job.getSparkConf().get(key);
         return v != null ? v : config.getExtraSparkConf().get(key);
     }
 
-    /** Wraps an argument in single quotes if it contains spaces or shell meta-characters. */
     private static String shellEscape(String arg) {
         if (arg.matches("[\\w./:=-]+")) return arg;
         return "'" + arg.replace("'", "'\\''") + "'";
@@ -528,7 +730,7 @@ class SparkYarnSubmitter {
             if (s.endsWith("m")) {
                 return Integer.parseInt(s.substring(0, s.length() - 1));
             }
-            return Integer.parseInt(s); // bare number assumed to be MB
+            return Integer.parseInt(s);
         }
 
         private MemoryParser() {}

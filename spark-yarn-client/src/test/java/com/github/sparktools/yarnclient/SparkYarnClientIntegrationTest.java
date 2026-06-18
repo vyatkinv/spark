@@ -490,10 +490,55 @@ class SparkYarnClientIntegrationTest {
         }
     }
 
-    // ── SparkYarnSubmitter unit tests ────────────────────────────────────────
+    // ── Memory overhead test ───────────────────────────────────────────────
 
     @Test
     @Order(11)
+    void memoryOverhead_addedToAmResource() {
+        // For 4g driver: 4096 MB * 0.10 = 409 MB overhead (> 384 min)
+        // Total = 4096 + 409 = 4505
+        int driverMb = SparkYarnSubmitter.MemoryParser.toMb("4g");
+        int overhead = Math.max(
+                (int) (driverMb * SparkYarnSubmitter.MEMORY_OVERHEAD_FACTOR),
+                SparkYarnSubmitter.MEMORY_OVERHEAD_MIN_MB);
+        assertEquals(4096, driverMb);
+        assertEquals(409, overhead);
+        assertEquals(4505, driverMb + overhead);
+    }
+
+    @Test
+    @Order(12)
+    void memoryOverhead_usesMinimumFor384mb() {
+        // For 1g driver: 1024 * 0.10 = 102 MB < 384 min → use 384
+        int driverMb = SparkYarnSubmitter.MemoryParser.toMb("1g");
+        int overhead = Math.max(
+                (int) (driverMb * SparkYarnSubmitter.MEMORY_OVERHEAD_FACTOR),
+                SparkYarnSubmitter.MEMORY_OVERHEAD_MIN_MB);
+        assertEquals(384, overhead);
+    }
+
+    // ── Staging dir permissions test ─────────────────────────────────────────
+
+    @Test
+    @Order(13)
+    void stagingDir_createdWith700Permissions() throws Exception {
+        FileSystem fs = FileSystem.newInstance(URI.create(hdfsUri), conf);
+        try {
+            Path stagingDir = new Path(hdfsUri + "/.sparkStaging/perm-test");
+            FileSystem.mkdirs(fs, stagingDir, SparkYarnSubmitter.STAGING_DIR_PERMISSION);
+
+            assertEquals("rwx------",
+                    fs.getFileStatus(stagingDir).getPermission().toString(),
+                    "Staging dir must have 700 permissions");
+        } finally {
+            fs.close();
+        }
+    }
+
+    // ── SparkYarnSubmitter unit tests ────────────────────────────────────────
+
+    @Test
+    @Order(14)
     void memoryParser_parsesVariousFormats() {
         assertEquals(1024, SparkYarnSubmitter.MemoryParser.toMb("1g"));
         assertEquals(512,  SparkYarnSubmitter.MemoryParser.toMb("512m"));

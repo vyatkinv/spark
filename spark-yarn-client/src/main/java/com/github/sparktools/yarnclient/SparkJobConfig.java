@@ -25,6 +25,9 @@ public final class SparkJobConfig {
     private final int executorCores;
     private final String driverMemory;
     private final int driverCores;
+    private final List<String> files;
+    private final List<String> archives;
+    private final List<String> jars;
 
     private SparkJobConfig(Builder b) {
         this.appName = b.appName;
@@ -39,6 +42,9 @@ public final class SparkJobConfig {
         this.executorCores = b.executorCores;
         this.driverMemory = b.driverMemory;
         this.driverCores = b.driverCores;
+        this.files = Collections.unmodifiableList(new ArrayList<>(b.files));
+        this.archives = Collections.unmodifiableList(new ArrayList<>(b.archives));
+        this.jars = Collections.unmodifiableList(new ArrayList<>(b.jars));
     }
 
     public String getAppName() { return appName; }
@@ -53,6 +59,12 @@ public final class SparkJobConfig {
     public int getExecutorCores() { return executorCores; }
     public String getDriverMemory() { return driverMemory; }
     public int getDriverCores() { return driverCores; }
+    /** HDFS/local paths to distribute as files to executor containers. */
+    public List<String> getFiles() { return files; }
+    /** HDFS/local paths to distribute as archives (extracted) to executor containers. */
+    public List<String> getArchives() { return archives; }
+    /** HDFS/local paths to additional JARs to add to executor classpaths. */
+    public List<String> getJars() { return jars; }
 
     public static Builder builder() { return new Builder(); }
 
@@ -69,6 +81,9 @@ public final class SparkJobConfig {
         private int executorCores = 1;
         private String driverMemory = "1g";
         private int driverCores = 1;
+        private final List<String> files = new ArrayList<>();
+        private final List<String> archives = new ArrayList<>();
+        private final List<String> jars = new ArrayList<>();
 
         public Builder appName(String appName) {
             this.appName = Objects.requireNonNull(appName);
@@ -118,6 +133,24 @@ public final class SparkJobConfig {
         public Builder executorCores(int cores) { this.executorCores = cores; return this; }
         public Builder driverMemory(String mem) { this.driverMemory = Objects.requireNonNull(mem); return this; }
         public Builder driverCores(int cores) { this.driverCores = cores; return this; }
+
+        /** Add a file (HDFS or local path) to distribute to executor containers. */
+        public Builder addFile(String path) {
+            files.add(Objects.requireNonNull(path));
+            return this;
+        }
+
+        /** Add an archive (HDFS or local path) to extract in executor containers. */
+        public Builder addArchive(String path) {
+            archives.add(Objects.requireNonNull(path));
+            return this;
+        }
+
+        /** Add a JAR (HDFS or local path) to executor classpaths. */
+        public Builder addJar(String path) {
+            jars.add(Objects.requireNonNull(path));
+            return this;
+        }
 
         public SparkJobConfig build() {
             Objects.requireNonNull(appName, "appName is required");
