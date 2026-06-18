@@ -15,16 +15,18 @@ library only eliminates the need for `spark-submit` on the submitting machine.
 1. [Prerequisites](#prerequisites)
 2. [Dependency](#dependency)
 3. [Quick start](#quick-start)
-4. [Pre-staging Spark jars on HDFS](#pre-staging-spark-jars-on-hdfs)
-5. [SparkYarnConfig reference](#sparkyarnconfig-reference)
-6. [SparkJobConfig reference](#sparkjobconfig-reference)
-7. [Monitoring submitted applications](#monitoring-submitted-applications)
-8. [Kerberos](#kerberos)
-9. [Java 8 clusters](#java-8-clusters)
-10. [YARN HA and HDFS HA](#yarn-ha-and-hdfs-ha)
-11. [Providing a custom Hadoop Configuration](#providing-a-custom-hadoop-configuration)
-12. [How it works](#how-it-works)
-13. [Running the tests](#running-the-tests)
+4. [Fat JAR mode (no Spark jars on HDFS)](#fat-jar-mode-no-spark-jars-on-hdfs)
+5. [Pre-staging Spark jars on HDFS](#pre-staging-spark-jars-on-hdfs)
+6. [Migrating from SparkLauncher](#migrating-from-sparklauncher)
+7. [SparkYarnConfig reference](#sparkyarnconfig-reference)
+8. [SparkJobConfig reference](#sparkjobconfig-reference)
+9. [Monitoring submitted applications](#monitoring-submitted-applications)
+10. [Kerberos](#kerberos)
+11. [Java 8 clusters](#java-8-clusters)
+12. [YARN HA and HDFS HA](#yarn-ha-and-hdfs-ha)
+13. [Providing a custom Hadoop Configuration](#providing-a-custom-hadoop-configuration)
+14. [How it works](#how-it-works)
+15. [Running the tests](#running-the-tests)
 
 ---
 
@@ -33,9 +35,9 @@ library only eliminates the need for `spark-submit` on the submitting machine.
 | Requirement | Details |
 |---|---|
 | Java | 8 or later |
-| Spark jars pre-staged on HDFS | See [Pre-staging Spark jars on HDFS](#pre-staging-spark-jars-on-hdfs) |
+| Spark jars on HDFS **or** a fat JAR | See [Fat JAR mode](#fat-jar-mode-no-spark-jars-on-hdfs) or [Pre-staging Spark jars on HDFS](#pre-staging-spark-jars-on-hdfs) |
 | Network access | The submitting machine must reach the YARN Resource Manager and HDFS NameNode |
-| `core-site.xml` / `yarn-site.xml` | Optional but recommended — Hadoop config files on the submitting machine so the client can auto-discover the cluster |
+| `HADOOP_CONF_DIR` | Optional but recommended — point to a directory with `core-site.xml` / `yarn-site.xml` so the client auto-discovers the cluster |
 
 No Spark installation is required on the submitting machine.
 
@@ -94,27 +96,17 @@ public class WordCount {
 }
 ```
 
-### 2. Pre-stage Spark jars on HDFS (one-time setup)
-
-```bash
-hdfs dfs -mkdir -p /spark/jars
-hdfs dfs -put $SPARK_HOME/jars/*.jar /spark/jars/
-```
-
-### 3. Submit the job
+### 2. Submit the job
 
 ```java
-// Cluster-level config (reuse across many submissions)
-SparkYarnConfig config = SparkYarnConfig.builder()
-    .hdfsUri("hdfs://namenode:8020")
-    .sparkConf("spark.yarn.jars", "hdfs:///spark/jars/*.jar")
-    .build();
+// Zero-config: reads fs.defaultFS and YARN RM from HADOOP_CONF_DIR.
+// Fat JAR mode — no Spark jars need to be pre-staged on HDFS.
+SparkYarnConfig config = SparkYarnConfig.builder().build();
 
-// Per-job parameters
 SparkJobConfig job = SparkJobConfig.builder()
     .appName("WordCount")
     .mainClass("com.example.WordCount")
-    .localJarPath("/home/user/wordcount-all.jar")
+    .localJarPath("/home/user/wordcount-fat.jar")
     .numExecutors(4)
     .executorMemory("2g")
     .executorCores(2)
@@ -149,6 +141,92 @@ String hdfsJar = client.uploadJar("/home/user/wordcount-all.jar");
 SubmittedApplication app1 = client.submitFromHdfs(job1, hdfsJar);
 SubmittedApplication app2 = client.submitFromHdfs(job2, hdfsJar);
 ```
+
+---
+
+## Fat JAR mode (no Spark jars on HDFS)
+
+When neither `spark.yarn.jars` nor `spark.yarn.archive` is configured, the client
+automatically uses **fat JAR mode**: your application JAR is registered as a
+`LocalResource` and added to the container classpath. The JAR must contain all Spark
+runtime classes (spark-core, spark-yarn, scala-library, etc.).
+
+Build the fat JAR by including Spark as `compile` dependencies (not `provided`):
+
+```xml
+<dependencies>
+    <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-core_2.12</artifactId>
+        <version>3.5.1</version>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-sql_2.12</artifactId>
+        <version>3.5.1</version>
+    </dependency>
+    <!-- Required — contains ApplicationMaster for YARN cluster mode -->
+    <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-yarn_2.12</artifactId>
+        <version>3.5.1</version>
+    </dependency>
+</dependencies>
+
+<build>
+    <plugins>
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-shade-plugin</artifactId>
+            <version>3.5.1</version>
+            <executions>
+                <execution>
+                    <phase>package</phase>
+                    <goals><goal>shade</goal></goals>
+                    <configuration>
+                        <transformers>
+                            <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                <mainClass>com.example.MySparkApp</mainClass>
+                            </transformer>
+                            <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                        </transformers>
+                        <filters>
+                            <filter>
+                                <artifact>*:*</artifact>
+                                <excludes>
+                                    <exclude>META-INF/*.SF</exclude>
+                                    <exclude>META-INF/*.DSA</exclude>
+                                    <exclude>META-INF/*.RSA</exclude>
+                                </excludes>
+                            </filter>
+                        </filters>
+                    </configuration>
+                </execution>
+            </executions>
+        </plugin>
+    </plugins>
+</build>
+```
+
+Then submit with zero config:
+
+```java
+SparkYarnConfig config = SparkYarnConfig.builder().build();
+
+SparkJobConfig job = SparkJobConfig.builder()
+    .appName("MyJob")
+    .mainClass("com.example.MySparkApp")
+    .localJarPath("/path/to/my-app-fat.jar")
+    .build();
+
+try (SparkYarnClient client = new SparkYarnClient(config)) {
+    client.submit(job).waitForTermination(30 * 60_000L);
+}
+```
+
+**Trade-off**: the fat JAR is typically 200-300 MB and uploaded to HDFS on every
+submission. For frequent submissions of the same app version, pre-staging Spark jars
+on HDFS (below) and using a thin app JAR is more efficient.
 
 ---
 
@@ -192,7 +270,7 @@ config = SparkYarnConfig.builder()
 The archive is extracted by the NodeManager into `__spark_libs__/` inside the container
 working directory and added to the CLASSPATH automatically.
 
-### Option C — pre-installed on every node (`local:` prefix)
+### Option C — pre-installed on every node (`local:` prefix)  
 
 If Spark is installed at the same path on every NodeManager host, skip HDFS staging:
 
@@ -208,6 +286,13 @@ LocalResources.
 
 ---
 
+## Migrating from SparkLauncher
+
+See [MIGRATION.md](MIGRATION.md) for a complete guide with before/after code examples,
+dependency changes, fat JAR build configuration, and an API mapping table.
+
+---
+
 ## SparkYarnConfig reference
 
 `SparkYarnConfig` holds cluster-level settings shared across all job submissions from a
@@ -215,8 +300,8 @@ single client instance. Build it once and reuse.
 
 | Builder method | Required | Default | Description |
 |---|---|---|---|
-| `hdfsUri(String)` | yes | — | HDFS NameNode URI, e.g. `hdfs://namenode:8020` or `hdfs://nameservice` for HA |
-| `hdfsJarUploadDir(String)` | no | `/spark-apps/jars` | HDFS directory where `uploadJar` places fat-JARs |
+| `hdfsUri(String)` | no | `fs.defaultFS` from Hadoop config | HDFS NameNode URI override, e.g. `hdfs://namenode:8020`. If not set, uses `fs.defaultFS` from `core-site.xml` in `HADOOP_CONF_DIR` |
+| `hdfsJarUploadDir(String)` | no | `/user/{username}/.spark-uploads/` | HDFS directory where `uploadJar` places fat-JARs. Auto-computed from the user's HDFS home directory if not set |
 | `sparkConf(String key, String value)` | no | — | Spark property applied to every job (call multiple times). Use this for `spark.yarn.jars` / `spark.yarn.archive` and any cluster-wide defaults |
 | `hadoopConf(Configuration)` | no | `new Configuration()` | Pre-built Hadoop `Configuration`. Auto-loaded from `core-site.xml` / `yarn-site.xml` on the classpath by default |
 | `kerberos(String principal, String keytabPath)` | no | disabled | Enable Kerberos — see [Kerberos](#kerberos) |
@@ -250,6 +335,9 @@ cluster-wide defaults in `SparkYarnConfig` and override them per-job.
 | `driverCores(int)` | no | `1` | CPU cores for the AM/driver container |
 | `addArg(String)` | no | — | Append a positional argument passed to the application's `main(String[])`. Call multiple times |
 | `addArgs(List<String>)` | no | — | Append multiple arguments at once |
+| `addFile(String)` | no | — | Distribute a file to executor containers (HDFS or local path) |
+| `addArchive(String)` | no | — | Distribute an archive (extracted) to executor containers |
+| `addJar(String)` | no | — | Add a JAR to executor classpaths |
 | `sparkConf(String key, String value)` | no | — | Per-job Spark property override (call multiple times). Useful for `spark.driver.extraJavaOptions`, `spark.sql.shuffle.partitions`, etc. |
 
 ### Memory format
@@ -533,39 +621,31 @@ only what goes into the YARN container launch command, not the local JVM.
 
 ## Running the tests
 
-The module ships with two integration test classes. They require no external infrastructure
-— everything runs in-process using `MiniDFSCluster`, `MiniYARNCluster`, and `MiniKdc`.
+The module ships with two test classes using Testcontainers (Docker). Config-only tests
+run without Docker; integration and Kerberos login tests require Docker.
 
 ```bash
-# Run all tests (integration + Kerberos)
+# Run all tests
 mvn test -pl spark-yarn-client
 
-# Run only integration tests
+# Run only integration tests (requires Docker)
 mvn test -pl spark-yarn-client -Dtest=SparkYarnClientIntegrationTest
 
-# Run only Kerberos tests
+# Run only Kerberos tests (config tests run without Docker)
 mvn test -pl spark-yarn-client -Dtest=SparkYarnKerberosTest
 ```
 
 ### What the tests cover
 
-**`SparkYarnClientIntegrationTest`** (10 tests):
-- Submitting a real Spark word-count application (`SimpleSparkApp`) that reads HDFS input,
-  counts words, and writes results back — verifying the full distributed execution path
-  (real ApplicationMaster + executor containers + task scheduling).
-- Verifying the YARN application reaches `FINISHED / SUCCEEDED`.
-- Verifying output files on HDFS contain the expected word counts.
-- Uploading a JAR and reusing it across multiple submissions.
-- Listing running applications.
-- Killing a running application and verifying `KILLED` state.
-- **Java 8 cross-version test**: submits via a Java 21 client configured with
-  `addJava9ModuleOpens(false)` and a Java 8 `javaHome`, then inspects the NodeManager's
-  `launch_container.sh` to assert that `--add-opens` flags are absent from the command.
+**`SparkYarnClientIntegrationTest`** (requires Docker — Hadoop container):
+- HDFS upload: create, overwrite, intermediate directories, file size preservation.
+- YARN connectivity: list running applications, query status.
+- Real Spark word-count submission and output verification.
+- Kill a running application.
+- Keytab distribution to AM container (upload + property rewrite).
+- Memory overhead calculation, staging dir permissions.
 
-**`SparkYarnKerberosTest`** (8 tests):
+**`SparkYarnKerberosTest`** (config tests always run; login tests require Docker KDC):
 - `isKerberosEnabled()` logic for all combinations of principal/keytab presence.
-- `KerberosSupport.login()` with real MiniKdc credentials — verifies the returned UGI is
-  backed by a keytab and has the expected principal name.
-- Post-login Hadoop configuration (`hadoop.security.authentication == kerberos`).
-- `buildSparkProperties()` includes `spark.kerberos.principal` and `spark.kerberos.keytab`
-  when Kerberos is configured, and omits them when it is not.
+- `KerberosSupport.login()` with a Dockerized MIT KDC.
+- `buildSparkProperties()` includes/omits Kerberos properties correctly.
