@@ -83,11 +83,13 @@ class SparkYarnKerberosTest {
 
     @Test
     @Order(3)
-    void isKerberosEnabled_falseWhenKeytabBlank() {
-        assertFalse(SparkYarnConfig.builder()
+    void isKerberosEnabled_trueWhenPrincipalSetKeytabBlank_tokenOnlyMode() {
+        SparkYarnConfig cfg = SparkYarnConfig.builder()
                 .hdfsUri("hdfs://host:8020")
                 .kerberos("user@REALM.COM", "")
-                .build().isKerberosEnabled());
+                .build();
+        assertTrue(cfg.isKerberosEnabled(), "Kerberos enabled in token-only mode");
+        assertFalse(cfg.hasKeytab(), "No keytab in token-only mode");
     }
 
     @Test
@@ -99,10 +101,22 @@ class SparkYarnKerberosTest {
                 .build().isKerberosEnabled());
     }
 
+    @Test
+    @Order(5)
+    void kerberosPrincipalOnly_tokenOnlyMode() {
+        SparkYarnConfig cfg = SparkYarnConfig.builder()
+                .hdfsUri("hdfs://host:8020")
+                .kerberosPrincipal("user@REALM.COM")
+                .build();
+        assertTrue(cfg.isKerberosEnabled());
+        assertFalse(cfg.hasKeytab());
+        assertNull(cfg.getKerberosKeytab());
+    }
+
     // ── KerberosSupport.login() with Dockerized KDC ──────────────────────────
 
     @Test
-    @Order(5)
+    @Order(6)
     void kerberosLogin_succeedsWithDockerKdcCredentials() throws Exception {
         assumeTrue(kdc != null, "Skipped: Docker is not available");
 
@@ -117,7 +131,7 @@ class SparkYarnKerberosTest {
     }
 
     @Test
-    @Order(6)
+    @Order(7)
     void kerberosLogin_setsHadoopSecurityAuthenticationOnConf() throws Exception {
         assumeTrue(kdc != null, "Skipped: Docker is not available");
 
@@ -133,7 +147,7 @@ class SparkYarnKerberosTest {
     // ── Kerberos properties forwarded to Spark conf (no Docker needed) ───────
 
     @Test
-    @Order(7)
+    @Order(8)
     void kerberosProperties_includedInSparkConf() {
         String principal = "spark/localhost@MY.REALM";
         String keytab = "/etc/keytabs/spark.keytab";
@@ -163,7 +177,7 @@ class SparkYarnKerberosTest {
     }
 
     @Test
-    @Order(8)
+    @Order(9)
     void kerberosProperties_absentInSparkConf_whenDisabled() {
         SparkYarnConfig config = SparkYarnConfig.builder()
                 .hdfsUri("hdfs://host:8020")

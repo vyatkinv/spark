@@ -59,7 +59,7 @@ public class SparkYarnClient implements Closeable {
     public SparkYarnClient(SparkYarnConfig config) throws IOException {
         this.config = config;
 
-        if (config.isKerberosEnabled()) {
+        if (config.hasKeytab()) {
             KerberosSupport.login(
                 config.getHadoopConf(),
                 config.getKerberosPrincipal(),
@@ -95,8 +95,8 @@ public class SparkYarnClient implements Closeable {
      */
     public SubmittedApplication submit(SparkJobConfig job) throws Exception {
         String hdfsJarUri = uploadJar(job.getLocalJarPath());
-        ApplicationId appId = submitter.submit(job, hdfsJarUri);
-        return new SubmittedApplication(appId, yarnClient);
+        SparkYarnSubmitter.SubmitResult result = submitter.submit(job, hdfsJarUri);
+        return new SubmittedApplication(result.appId, yarnClient, hdfs, result.stagingDir);
     }
 
     /**
@@ -108,8 +108,8 @@ public class SparkYarnClient implements Closeable {
      */
     public SubmittedApplication submitFromHdfs(SparkJobConfig job, String hdfsJarUri)
             throws Exception {
-        ApplicationId appId = submitter.submit(job, hdfsJarUri);
-        return new SubmittedApplication(appId, yarnClient);
+        SparkYarnSubmitter.SubmitResult result = submitter.submit(job, hdfsJarUri);
+        return new SubmittedApplication(result.appId, yarnClient, hdfs, result.stagingDir);
     }
 
     // -------------------------------------------------------------------------

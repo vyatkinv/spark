@@ -78,9 +78,21 @@ public final class SparkYarnConfig {
      */
     public boolean isAddJava9ModuleOpens() { return addJava9ModuleOpens; }
 
+    /**
+     * Returns {@code true} if Kerberos authentication is configured
+     * (principal is set, with or without a keytab).
+     */
     public boolean isKerberosEnabled() {
-        return kerberosPrincipal != null && !kerberosPrincipal.isEmpty()
-                && kerberosKeytab != null && !kerberosKeytab.isEmpty();
+        return kerberosPrincipal != null && !kerberosPrincipal.isEmpty();
+    }
+
+    /**
+     * Returns {@code true} if a keytab file is configured for distribution
+     * to the AM container. When {@code false} but Kerberos is enabled,
+     * only delegation tokens are sent (token-only mode).
+     */
+    public boolean hasKeytab() {
+        return kerberosKeytab != null && !kerberosKeytab.isEmpty();
     }
 
     public static Builder builder() { return new Builder(); }
@@ -136,10 +148,20 @@ public final class SparkYarnConfig {
             return this;
         }
 
-        /** Enable Kerberos authentication with a keytab. */
+        /** Enable Kerberos authentication with a keytab (distributed to the AM container). */
         public Builder kerberos(String principal, String keytabPath) {
             this.kerberosPrincipal = Objects.requireNonNull(principal);
             this.kerberosKeytab = Objects.requireNonNull(keytabPath);
+            return this;
+        }
+
+        /**
+         * Enable Kerberos in token-only mode: delegation tokens from the current
+         * {@code kinit} session are sent to the AM, but no keytab is distributed.
+         * Suitable for short-lived jobs where token lifetime is sufficient.
+         */
+        public Builder kerberosPrincipal(String principal) {
+            this.kerberosPrincipal = Objects.requireNonNull(principal);
             return this;
         }
 

@@ -72,6 +72,8 @@ class SparkYarnSubmitter {
             FsPermission.createImmutable((short) 0700);
     static final FsPermission APP_FILE_PERMISSION =
             FsPermission.createImmutable((short) 0644);
+    static final FsPermission KEYTAB_FILE_PERMISSION =
+            FsPermission.createImmutable((short) 0600);
 
     static final int MEMORY_OVERHEAD_MIN_MB = 384;
     static final double MEMORY_OVERHEAD_FACTOR = 0.10;
@@ -90,7 +92,17 @@ class SparkYarnSubmitter {
     // Entry point
     // -------------------------------------------------------------------------
 
-    ApplicationId submit(SparkJobConfig job, String hdfsJarUri) throws Exception {
+    /** Result of submission: application ID + staging dir for cleanup. */
+    static final class SubmitResult {
+        final ApplicationId appId;
+        final Path stagingDir;
+        SubmitResult(ApplicationId appId, Path stagingDir) {
+            this.appId = appId;
+            this.stagingDir = stagingDir;
+        }
+    }
+
+    SubmitResult submit(SparkJobConfig job, String hdfsJarUri) throws Exception {
         YarnClientApplication app = yarnClient.createApplication();
         ApplicationId appId = app.getNewApplicationResponse().getApplicationId();
         log.info("Created YARN application {}", appId);
@@ -100,14 +112,15 @@ class SparkYarnSubmitter {
         log.debug("Staging directory: {}", stagingDir);
 
         try {
-            return doSubmit(app, appId, job, hdfsJarUri, stagingDir);
+            doSubmit(app, appId, job, hdfsJarUri, stagingDir);
+            return new SubmitResult(appId, stagingDir);
         } catch (Exception e) {
             cleanupStagingDir(stagingDir);
             throw e;
         }
     }
 
-    private ApplicationId doSubmit(YarnClientApplication app, ApplicationId appId,
+    private void doSubmit(YarnClientApplication app, ApplicationId appId,
             SparkJobConfig job, String hdfsJarUri, Path stagingDir) throws Exception {
 
         Properties sparkProps = buildSparkProperties(job, hdfsJarUri, stagingDir);
@@ -116,7 +129,8 @@ class SparkYarnSubmitter {
 
         // Keytab must be distributed before conf archive upload — the archive
         // must contain the container-relative keytab path, not the local one.
-        if (config.isKerberosEnabled()) {
+        // In token-only mode (principal set, no keytab), skip distribution.
+        if (config.hasKeytab()) {
             distributeKeytab(stagingDir, sparkProps, localResources);
         }
 
@@ -167,7 +181,6 @@ class SparkYarnSubmitter {
 
         yarnClient.submitApplication(ctx);
         log.info("Submitted application '{}' as {}", job.getAppName(), appId);
-        return appId;
     }
 
     // -------------------------------------------------------------------------
@@ -250,10 +263,12 @@ class SparkYarnSubmitter {
         config.getExtraSparkConf().forEach(p::setProperty);
         job.getSparkConf().forEach(p::setProperty);
 
-        // Kerberos
+        // Kerberos — principal is always forwarded; keytab only when available
         if (config.isKerberosEnabled()) {
             p.setProperty("spark.kerberos.principal", config.getKerberosPrincipal());
-            p.setProperty("spark.kerberos.keytab",    config.getKerberosKeytab());
+        }
+        if (config.hasKeytab()) {
+            p.setProperty("spark.kerberos.keytab", config.getKerberosKeytab());
         }
 
         return p;
@@ -674,11 +689,13 @@ class SparkYarnSubmitter {
             Map<String, LocalResource> localResources) throws IOException {
         String keytabPath = config.getKerberosKeytab();
         Path src = new Path(keytabPath);
-        String keytabName = src.getName();
+        // UUID suffix makes the HDFS path unpredictable, preventing targeted access
+        // by an attacker who knows the application ID (visible in YARN UI).
+        String keytabName = src.getName() + "-" + UUID.randomUUID();
         Path dest = new Path(stagingDir, keytabName);
 
         hdfs.copyFromLocalFile(false, true, src, dest);
-        hdfs.setPermission(dest, APP_FILE_PERMISSION);
+        hdfs.setPermission(dest, KEYTAB_FILE_PERMISSION);
         localResources.put(keytabName,
                 buildResource(hdfs.getFileStatus(dest), LocalResourceType.FILE));
 
