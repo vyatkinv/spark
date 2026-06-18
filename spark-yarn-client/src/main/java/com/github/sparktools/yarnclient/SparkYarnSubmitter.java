@@ -95,9 +95,7 @@ class SparkYarnSubmitter {
         ApplicationId appId = app.getNewApplicationResponse().getApplicationId();
         log.info("Created YARN application {}", appId);
 
-        Path stagingDir = new Path(
-            config.getHadoopConf().get("fs.defaultFS", config.getHdfsUri())
-            + "/.sparkStaging/" + appId);
+        Path stagingDir = resolveStagingDir(appId);
         FileSystem.mkdirs(hdfs, stagingDir, STAGING_DIR_PERMISSION);
         log.debug("Staging directory: {}", stagingDir);
 
@@ -170,6 +168,32 @@ class SparkYarnSubmitter {
         yarnClient.submitApplication(ctx);
         log.info("Submitted application '{}' as {}", job.getAppName(), appId);
         return appId;
+    }
+
+    // -------------------------------------------------------------------------
+    // Staging directory resolution
+    // -------------------------------------------------------------------------
+
+    /**
+     * Computes the per-application staging directory, matching Spark's
+     * {@code Client.scala} logic:
+     * <ol>
+     *   <li>If {@code spark.yarn.stagingDir} is set in the config:
+     *       {@code {stagingDir}/{username}/.sparkStaging/{appId}}</li>
+     *   <li>Otherwise: {@code {hdfs.getHomeDirectory()}/.sparkStaging/{appId}}
+     *       (typically {@code /user/{username}/.sparkStaging/{appId}})</li>
+     * </ol>
+     */
+    private Path resolveStagingDir(ApplicationId appId) throws IOException {
+        Path baseDir;
+        String configured = config.getExtraSparkConf().get("spark.yarn.stagingDir");
+        if (configured != null) {
+            String userName = UserGroupInformation.getCurrentUser().getShortUserName();
+            baseDir = new Path(configured, userName);
+        } else {
+            baseDir = hdfs.getHomeDirectory();
+        }
+        return new Path(baseDir, ".sparkStaging/" + appId);
     }
 
     // -------------------------------------------------------------------------

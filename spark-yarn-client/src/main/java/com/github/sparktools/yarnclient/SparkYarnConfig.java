@@ -52,6 +52,7 @@ public final class SparkYarnConfig {
     }
 
     public String getHdfsUri() { return hdfsUri; }
+    /** Explicit HDFS directory for JAR uploads, or {@code null} for auto (home dir). */
     public String getHdfsJarUploadDir() { return hdfsJarUploadDir; }
     /** Java home on YARN cluster nodes. Null means use {@code $JAVA_HOME} env variable. */
     public String getJavaHome() { return javaHome; }
@@ -75,7 +76,7 @@ public final class SparkYarnConfig {
 
     public static final class Builder {
         private String hdfsUri;
-        private String hdfsJarUploadDir = "/spark-apps/jars";
+        private String hdfsJarUploadDir;
         private String javaHome;
         private String amClass = DEFAULT_AM_CLASS;
         private String kerberosPrincipal;
@@ -90,7 +91,11 @@ public final class SparkYarnConfig {
             return this;
         }
 
-        /** HDFS directory where fat-JARs are uploaded (default: /spark-apps/jars). */
+        /**
+         * HDFS directory where fat-JARs are uploaded.
+         * If not set, defaults to the user's HDFS home directory
+         * ({@code /user/{username}/.spark-uploads/}).
+         */
         public Builder hdfsJarUploadDir(String dir) {
             this.hdfsJarUploadDir = Objects.requireNonNull(dir);
             return this;

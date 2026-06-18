@@ -123,7 +123,7 @@ public class SparkYarnClient implements Closeable {
      */
     public String uploadJar(String localJarPath) throws Exception {
         Path src     = new Path(localJarPath);
-        Path destDir = new Path(config.getHdfsUri() + config.getHdfsJarUploadDir());
+        Path destDir = resolveJarUploadDir();
         Path dest    = new Path(destDir, src.getName());
 
         if (config.isKerberosEnabled()) {
@@ -138,6 +138,14 @@ public class SparkYarnClient implements Closeable {
 
         log.info("Uploaded {} → {}", localJarPath, dest.toUri());
         return dest.toUri().toString();
+    }
+
+    private Path resolveJarUploadDir() throws IOException {
+        String explicit = config.getHdfsJarUploadDir();
+        if (explicit != null) {
+            return new Path(config.getHdfsUri() + explicit);
+        }
+        return new Path(hdfs.getHomeDirectory(), ".spark-uploads");
     }
 
     private void doUpload(Path src, Path destDir, Path dest) throws IOException {
