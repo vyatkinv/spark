@@ -86,84 +86,7 @@
 
     <!-- ===== Test dependencies ===== -->
 
-    <!--
-      Non-shaded Hadoop test infrastructure. Using individual artifacts instead of
-      hadoop-client-minicluster, which shades javax.servlet to
-      org.apache.hadoop.shaded.javax.servlet, making Hadoop's built-in servlets
-      (FsckServlet, ImageServlet, etc.) incompatible with Jetty's type check for
-      javax.servlet.Servlet.
-
-      hadoop-hdfs (server-side classes: NameNode, DataNode, FsckServlet) must appear
-      on the classpath with real javax.servlet so Jetty accepts the servlets.
-      hadoop-hdfs:tests provides MiniDFSCluster.
-      hadoop-yarn-server-tests:tests provides MiniYARNCluster; version + exclusions
-      are managed by the parent pom dependencyManagement.
-      hadoop-yarn-server-resourcemanager is managed by the parent pom as well.
-    -->
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-hdfs</artifactId>
-      <version>${hadoop.version}</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-hdfs</artifactId>
-      <version>${hadoop.version}</version>
-      <classifier>tests</classifier>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-common</artifactId>
-      <version>${hadoop.version}</version>
-      <classifier>tests</classifier>
-      <scope>test</scope>
-      <exclusions>
-        <exclusion>
-          <groupId>javax.servlet</groupId>
-          <artifactId>servlet-api</artifactId>
-        </exclusion>
-      </exclusions>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-yarn-server-tests</artifactId>
-      <classifier>tests</classifier>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-yarn-server-resourcemanager</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <!-- Used internally by MiniYARNCluster for TLS -->
-    <dependency>
-      <groupId>org.bouncycastle</groupId>
-      <artifactId>bcprov-jdk18on</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.bouncycastle</groupId>
-      <artifactId>bcpkix-jdk18on</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <!-- Used internally by MiniDFSCluster / MiniYARNCluster -->
-    <dependency>
-      <groupId>org.mockito</groupId>
-      <artifactId>mockito-core</artifactId>
-      <!-- version managed in parent dependencyManagement -->
-      <scope>test</scope>
-    </dependency>
-    <!-- MiniYARNCluster uses JUnit 4 Assert internally -->
-    <dependency>
-      <groupId>junit</groupId>
-      <artifactId>junit</artifactId>
-      <!-- version managed in parent dependencyManagement -->
-      <scope>test</scope>
-    </dependency>
-
-    <!-- JUnit 5 for our own tests (not yet in parent dependencyManagement) -->
+    <!-- JUnit 5 (not yet in parent dependencyManagement) -->
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
@@ -171,7 +94,23 @@
       <scope>test</scope>
     </dependency>
 
-    <!-- Real Spark AM and executor classes for integration tests -->
+    <!-- Testcontainers: Docker-based Hadoop (HDFS + YARN) and KDC containers -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <version>1.20.6</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>1.20.6</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- Real Spark AM and executor classes for integration tests.
+         These JARs are bind-mounted into the Hadoop Docker container so
+         YARN containers have Spark classes on their classpath. -->
     <dependency>
       <groupId>org.apache.spark</groupId>
       <artifactId>spark-core_2.12</artifactId>
@@ -185,13 +124,9 @@
       <scope>test</scope>
     </dependency>
 
-    <!-- In-process Kerberos KDC for Kerberos integration tests -->
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-minikdc</artifactId>
-      <version>${hadoop.version}</version>
-      <scope>test</scope>
-    </dependency>
+    <!-- HDFS client classes needed at test compile time (FileSystem, Path, etc.
+         are in hadoop-hdfs-client which is a main dependency; server-side classes
+         for MiniDFS/MiniYARN are no longer needed since we use Docker) -->
 
     <!-- Logging for tests -->
     <dependency>
