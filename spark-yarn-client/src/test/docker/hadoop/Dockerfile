@@ -12,10 +12,17 @@ ENV YARN_NODEMANAGER_USER=root
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl procps \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -sL "https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz" \
-       | tar xz -C /opt \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fL --progress-bar \
+       "https://dlcdn.apache.org/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz" \
+       -o /tmp/hadoop.tar.gz \
+    || curl -fL --progress-bar \
+       "https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz" \
+       -o /tmp/hadoop.tar.gz \
+    && tar xzf /tmp/hadoop.tar.gz -C /opt \
     && mv "/opt/hadoop-${HADOOP_VERSION}" "${HADOOP_HOME}" \
+    && rm /tmp/hadoop.tar.gz \
     && mkdir -p /data/hdfs/namenode /data/hdfs/datanode /opt/spark-jars
 
 COPY core-site.xml hdfs-site.xml yarn-site.xml $HADOOP_HOME/etc/hadoop/
