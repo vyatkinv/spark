@@ -126,6 +126,7 @@ class SparkYarnSubmitter {
         Properties sparkProps = buildSparkProperties(job, hdfsJarUri, stagingDir);
 
         Map<String, LocalResource> localResources = new LinkedHashMap<>();
+        List<DistCacheEntry> distCacheEntries = new ArrayList<>();
 
         // Keytab must be distributed before conf archive upload — the archive
         // must contain the container-relative keytab path, not the local one.
@@ -134,21 +135,51 @@ class SparkYarnSubmitter {
             distributeKeytab(stagingDir, sparkProps, localResources);
         }
 
-        // Distribute user-specified files, archives, and jars
-        Properties distCacheProps = distributeUserResources(
-                job, stagingDir, sparkProps, localResources);
-
-        Path confArchive = uploadConfArchive(stagingDir, sparkProps, distCacheProps);
-        localResources.put(CONF_ARCHIVE_KEY, archiveResource(confArchive));
-
-        // Register the app JAR as a LocalResource so it's available in the container
+        // Register the app JAR as a LocalResource AND add to dist cache so
+        // executors receive it too (matching Client.scala's distribute() call
+        // with appMasterOnly = false).
         FileStatus appJarStat = hdfs.getFileStatus(new Path(hdfsJarUri));
         localResources.put(APP_JAR_KEY,
                 buildResource(appJarStat, LocalResourceType.FILE));
+        distCacheEntries.add(new DistCacheEntry(
+                appJarStat.getPath().toUri(), APP_JAR_KEY,
+                appJarStat.getLen(), appJarStat.getModificationTime(),
+                LocalResourceType.FILE));
 
-        List<String> sparkLibCp = resolveSparkLibs(localResources, sparkProps);
+        boolean fatJarMode = sparkProps.getProperty("spark.yarn.archive") == null
+                && sparkProps.getProperty("spark.yarn.jars") == null;
 
-        Map<String, String> env = buildContainerEnv(sparkLibCp, stagingDir);
+        // Spark distribution libs (archive or individual jars); in fat-jar mode
+        // no separate libs are registered.
+        List<String> sparkLibCp = resolveSparkLibs(
+                localResources, sparkProps, distCacheEntries);
+
+        // In fat-jar mode, tell the AM not to add the Hadoop/YARN classpath
+        // to executor containers — all classes live inside __app__.jar.
+        if (fatJarMode) {
+            sparkProps.putIfAbsent("spark.yarn.populateHadoopClasspath", "false");
+        }
+
+        // Distribute user-specified files, archives, and jars
+        distributeUserResources(
+                job, stagingDir, sparkProps, localResources, distCacheEntries);
+
+        // Build the distributed cache properties that the AM reads to create
+        // executor LocalResources.  Uses the comma-separated format expected by
+        // SparkConf's toSequence config entries.
+        Properties distCacheProps = buildDistCacheProperties(distCacheEntries);
+
+        // Pre-compute the conf archive path; set spark.yarn.cache.confArchive so
+        // the AM can distribute the archive to executor containers.
+        Path confArchivePath = new Path(stagingDir, CONF_ARCHIVE_KEY + ".zip");
+        distCacheProps.setProperty("spark.yarn.cache.confArchive",
+                hdfs.makeQualified(confArchivePath).toUri().toString());
+
+        Path confArchive = uploadConfArchive(
+                stagingDir, sparkProps, distCacheProps);
+        localResources.put(CONF_ARCHIVE_KEY, archiveResource(confArchive));
+
+        Map<String, String> env = buildContainerEnv(sparkLibCp, stagingDir, fatJarMode);
         List<String> command    = buildAmCommand(job, hdfsJarUri);
 
         ByteBuffer tokens = config.isKerberosEnabled()
@@ -306,16 +337,14 @@ class SparkYarnSubmitter {
 
     /**
      * Distributes user-specified files, archives, and jars to the HDFS staging
-     * directory, registers them as {@link LocalResource}s, and sets the
-     * corresponding {@code spark.yarn.dist.*} properties so the AM can
-     * propagate them to executor containers.
-     *
-     * @return distributed cache properties for inclusion in the conf archive
+     * directory, registers them as {@link LocalResource}s for the AM container,
+     * and adds them to the dist cache entries so the AM propagates them to
+     * executor containers.
      */
-    private Properties distributeUserResources(SparkJobConfig job, Path stagingDir,
-            Properties sparkProps, Map<String, LocalResource> localResources) throws IOException {
+    private void distributeUserResources(SparkJobConfig job, Path stagingDir,
+            Properties sparkProps, Map<String, LocalResource> localResources,
+            List<DistCacheEntry> distCacheEntries) throws IOException {
 
-        Properties distCacheProps = new Properties();
         List<String> distFiles = new ArrayList<>();
         List<String> distArchives = new ArrayList<>();
         List<String> distJars = new ArrayList<>();
@@ -323,25 +352,40 @@ class SparkYarnSubmitter {
         for (String filePath : job.getFiles()) {
             Path uploaded = stageFile(stagingDir, filePath);
             String name = uploaded.getName();
+            FileStatus stat = hdfs.getFileStatus(uploaded);
             localResources.put(name,
-                    buildResource(hdfs.getFileStatus(uploaded), LocalResourceType.FILE));
+                    buildResource(stat, LocalResourceType.FILE));
             distFiles.add(uploaded.toUri().toString());
+            distCacheEntries.add(new DistCacheEntry(
+                    stat.getPath().toUri(), name,
+                    stat.getLen(), stat.getModificationTime(),
+                    LocalResourceType.FILE));
         }
 
         for (String archivePath : job.getArchives()) {
             Path uploaded = stageFile(stagingDir, archivePath);
             String name = uploaded.getName();
+            FileStatus stat = hdfs.getFileStatus(uploaded);
             localResources.put(name,
-                    buildResource(hdfs.getFileStatus(uploaded), LocalResourceType.ARCHIVE));
+                    buildResource(stat, LocalResourceType.ARCHIVE));
             distArchives.add(uploaded.toUri().toString());
+            distCacheEntries.add(new DistCacheEntry(
+                    stat.getPath().toUri(), name,
+                    stat.getLen(), stat.getModificationTime(),
+                    LocalResourceType.ARCHIVE));
         }
 
         for (String jarPath : job.getJars()) {
             Path uploaded = stageFile(stagingDir, jarPath);
             String name = uploaded.getName();
+            FileStatus stat = hdfs.getFileStatus(uploaded);
             localResources.put(name,
-                    buildResource(hdfs.getFileStatus(uploaded), LocalResourceType.FILE));
+                    buildResource(stat, LocalResourceType.FILE));
             distJars.add(uploaded.toUri().toString());
+            distCacheEntries.add(new DistCacheEntry(
+                    stat.getPath().toUri(), name,
+                    stat.getLen(), stat.getModificationTime(),
+                    LocalResourceType.FILE));
         }
 
         if (!distFiles.isEmpty()) {
@@ -353,32 +397,65 @@ class SparkYarnSubmitter {
         if (!distJars.isEmpty()) {
             sparkProps.setProperty("spark.yarn.dist.jars", String.join(",", distJars));
         }
+    }
 
-        // Build dist cache properties that the AM reads via --dist-cache-conf
-        int idx = 0;
-        for (String uri : distFiles) {
-            distCacheProps.setProperty("spark.yarn.cache.filenames." + idx, uri);
-            distCacheProps.setProperty("spark.yarn.cache.types." + idx, "FILE");
-            distCacheProps.setProperty("spark.yarn.cache.visibilities." + idx, "APPLICATION");
-            idx++;
-        }
-        for (String uri : distArchives) {
-            distCacheProps.setProperty("spark.yarn.cache.filenames." + idx, uri);
-            distCacheProps.setProperty("spark.yarn.cache.types." + idx, "ARCHIVE");
-            distCacheProps.setProperty("spark.yarn.cache.visibilities." + idx, "APPLICATION");
-            idx++;
-        }
-        for (String uri : distJars) {
-            distCacheProps.setProperty("spark.yarn.cache.filenames." + idx, uri);
-            distCacheProps.setProperty("spark.yarn.cache.types." + idx, "FILE");
-            distCacheProps.setProperty("spark.yarn.cache.visibilities." + idx, "APPLICATION");
-            idx++;
-        }
-        if (idx > 0) {
-            distCacheProps.setProperty("spark.yarn.cache.size", String.valueOf(idx));
+    /**
+     * Builds the distributed cache properties in the comma-separated format
+     * that Spark's AM expects ({@code spark.yarn.cache.filenames}, etc.).
+     * Each URI carries the link name as a fragment so the AM uses it as the
+     * LocalResource key (= filename inside the executor container).
+     */
+    // Package-private for testing
+    Properties buildDistCacheProperties(List<DistCacheEntry> entries) {
+        Properties p = new Properties();
+        if (entries.isEmpty()) {
+            return p;
         }
 
-        return distCacheProps;
+        StringJoiner filenames    = new StringJoiner(",");
+        StringJoiner sizes        = new StringJoiner(",");
+        StringJoiner timestamps   = new StringJoiner(",");
+        StringJoiner visibilities = new StringJoiner(",");
+        StringJoiner types        = new StringJoiner(",");
+
+        for (DistCacheEntry e : entries) {
+            try {
+                java.net.URI uri = new java.net.URI(
+                        e.uri.getScheme(), e.uri.getAuthority(),
+                        e.uri.getPath(), null, e.linkName);
+                filenames.add(uri.toString());
+            } catch (java.net.URISyntaxException ex) {
+                throw new IllegalArgumentException("Invalid dist cache URI: " + e.uri, ex);
+            }
+            sizes.add(String.valueOf(e.size));
+            timestamps.add(String.valueOf(e.timestamp));
+            visibilities.add("PRIVATE");
+            types.add(e.resourceType.name());
+        }
+
+        p.setProperty("spark.yarn.cache.filenames",     filenames.toString());
+        p.setProperty("spark.yarn.cache.sizes",          sizes.toString());
+        p.setProperty("spark.yarn.cache.timestamps",     timestamps.toString());
+        p.setProperty("spark.yarn.cache.visibilities",   visibilities.toString());
+        p.setProperty("spark.yarn.cache.types",          types.toString());
+        return p;
+    }
+
+    static final class DistCacheEntry {
+        final java.net.URI uri;
+        final String linkName;
+        final long size;
+        final long timestamp;
+        final LocalResourceType resourceType;
+
+        DistCacheEntry(java.net.URI uri, String linkName, long size, long timestamp,
+                LocalResourceType resourceType) {
+            this.uri = uri;
+            this.linkName = linkName;
+            this.size = size;
+            this.timestamp = timestamp;
+            this.resourceType = resourceType;
+        }
     }
 
     /**
@@ -497,15 +574,16 @@ class SparkYarnSubmitter {
      * at the cost of a larger per-submission upload.
      */
     private List<String> resolveSparkLibs(
-            Map<String, LocalResource> localResources, Properties sparkProps) throws IOException {
+            Map<String, LocalResource> localResources, Properties sparkProps,
+            List<DistCacheEntry> distCacheEntries) throws IOException {
 
         String archive = sparkProps.getProperty("spark.yarn.archive");
         String jars    = sparkProps.getProperty("spark.yarn.jars");
 
         if (archive != null) {
-            return resolveFromArchive(localResources, archive);
+            return resolveFromArchive(localResources, archive, distCacheEntries);
         } else if (jars != null) {
-            return resolveFromJarsGlob(localResources, jars);
+            return resolveFromJarsGlob(localResources, jars, distCacheEntries);
         } else {
             log.info("Neither spark.yarn.archive nor spark.yarn.jars is set — "
                 + "using fat JAR mode (Spark classes expected inside the application JAR)");
@@ -516,11 +594,16 @@ class SparkYarnSubmitter {
 
     /** Single archive (zip/tar/tgz) → extracted by NM to {{PWD}}/__spark_libs__/ */
     private List<String> resolveFromArchive(
-            Map<String, LocalResource> localResources, String archivePath) throws IOException {
+            Map<String, LocalResource> localResources, String archivePath,
+            List<DistCacheEntry> distCacheEntries) throws IOException {
 
         Path path = new Path(archivePath);
         FileStatus stat = hdfs.getFileStatus(path);
         localResources.put(SPARK_LIBS_KEY, buildResource(stat, LocalResourceType.ARCHIVE));
+        distCacheEntries.add(new DistCacheEntry(
+                stat.getPath().toUri(), SPARK_LIBS_KEY,
+                stat.getLen(), stat.getModificationTime(),
+                LocalResourceType.ARCHIVE));
         log.debug("Registered Spark archive: {}", path);
         return Collections.singletonList(
             Environment.PWD.$$() + "/" + SPARK_LIBS_KEY + "/*");
@@ -537,7 +620,8 @@ class SparkYarnSubmitter {
      * </ul>
      */
     private List<String> resolveFromJarsGlob(
-            Map<String, LocalResource> localResources, String jarsSpec) throws IOException {
+            Map<String, LocalResource> localResources, String jarsSpec,
+            List<DistCacheEntry> distCacheEntries) throws IOException {
 
         List<String> classpathEntries = new ArrayList<>();
 
@@ -556,9 +640,13 @@ class SparkYarnSubmitter {
                 continue;
             }
             for (FileStatus stat : matches) {
-                String key = stat.getPath().getName();
+                String key = SPARK_LIBS_KEY + "/" + stat.getPath().getName();
                 if (!localResources.containsKey(key)) {
                     localResources.put(key, buildResource(stat, LocalResourceType.FILE));
+                    distCacheEntries.add(new DistCacheEntry(
+                            stat.getPath().toUri(), key,
+                            stat.getLen(), stat.getModificationTime(),
+                            LocalResourceType.FILE));
                 }
                 classpathEntries.add(Environment.PWD.$$() + "/" + key);
             }
@@ -572,7 +660,8 @@ class SparkYarnSubmitter {
     // Container environment (CLASSPATH, SPARK_USER, etc.)
     // -------------------------------------------------------------------------
 
-    private Map<String, String> buildContainerEnv(List<String> sparkLibCp, Path stagingDir) {
+    private Map<String, String> buildContainerEnv(
+            List<String> sparkLibCp, Path stagingDir, boolean fatJarMode) {
         Map<String, String> env = new LinkedHashMap<>();
         env.put("SPARK_YARN_MODE", "true");
         env.put("SPARK_YARN_STAGING_DIR", stagingDir.toUri().toString());
@@ -586,18 +675,20 @@ class SparkYarnSubmitter {
 
         List<String> cp = new ArrayList<>();
 
-        // Hadoop-provided classpath (Hadoop jars, config dir, etc.)
-        String[] yarnCp = config.getHadoopConf().getStrings(
-            YarnConfiguration.YARN_APPLICATION_CLASSPATH,
-            YarnConfiguration.DEFAULT_YARN_APPLICATION_CLASSPATH);
-        cp.addAll(Arrays.asList(yarnCp));
+        if (!fatJarMode) {
+            // Hadoop-provided classpath (Hadoop jars, config dir, etc.)
+            String[] yarnCp = config.getHadoopConf().getStrings(
+                YarnConfiguration.YARN_APPLICATION_CLASSPATH,
+                YarnConfiguration.DEFAULT_YARN_APPLICATION_CLASSPATH);
+            cp.addAll(Arrays.asList(yarnCp));
 
-        // MapReduce application classpath (some distros put essential jars here)
-        String[] mrCp = config.getHadoopConf().getStrings(
-            MRJobConfig.MAPREDUCE_APPLICATION_CLASSPATH,
-            MRJobConfig.DEFAULT_MAPREDUCE_APPLICATION_CLASSPATH);
-        if (mrCp != null) {
-            cp.addAll(Arrays.asList(mrCp));
+            // MapReduce application classpath (some distros put essential jars here)
+            String[] mrCp = config.getHadoopConf().getStrings(
+                MRJobConfig.MAPREDUCE_APPLICATION_CLASSPATH,
+                MRJobConfig.DEFAULT_MAPREDUCE_APPLICATION_CLASSPATH);
+            if (mrCp != null) {
+                cp.addAll(Arrays.asList(mrCp));
+            }
         }
 
         // Container working directory
@@ -606,7 +697,7 @@ class SparkYarnSubmitter {
         cp.add(Environment.PWD.$$() + "/" + CONF_ARCHIVE_KEY);
         // Hadoop conf subdirectory inside the conf archive
         cp.add(Environment.PWD.$$() + "/" + CONF_ARCHIVE_KEY + "/" + HADOOP_CONF_DIR);
-        // Spark lib jars (from archive or individual files)
+        // Spark lib jars (from archive or individual files) or __app__.jar in fat-jar mode
         cp.addAll(sparkLibCp);
 
         env.put("CLASSPATH", String.join(File.pathSeparator, cp));

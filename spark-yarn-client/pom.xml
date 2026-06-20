@@ -147,4 +147,6 @@
     Integration tests (MiniDFS + MiniYARN) run under maven-surefire-plugin,
     exactly as spark-yarn does in resource-managers/yarn.
   -->
+
+
 </project>

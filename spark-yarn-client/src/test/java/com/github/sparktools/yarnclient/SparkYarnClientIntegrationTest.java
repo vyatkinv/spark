@@ -256,6 +256,110 @@ class SparkYarnClientIntegrationTest {
                 "Application must be in terminal state after kill: " + afterKill.getState());
     }
 
+    // ── Fat-JAR mode test ─────────────────────────────────────────────────────
+
+    @Test
+    @Order(14)
+    @Timeout(300)
+    void submitFatJarMode_countsWordsOnHdfs() throws Exception {
+        String outputHdfsPath = hdfsUri + "/test-output/fatjar-" + System.currentTimeMillis();
+
+        // Create a separate client without spark.yarn.jars / spark.yarn.archive
+        // to exercise the fat-jar code path where __app__.jar must be distributed
+        // to executors via the distributed cache.
+        SparkYarnConfig fatJarConfig = SparkYarnConfig.builder()
+                .hdfsUri(hdfsUri)
+                .hdfsJarUploadDir("/spark-apps/jars")
+                .hadoopConf(conf)
+                .sparkConf("spark.yarn.populateHadoopClasspath", "true")
+                .sparkConf("spark.shuffle.service.enabled", "false")
+                .sparkConf("spark.dynamicAllocation.enabled", "false")
+                .build();
+
+        try (SparkYarnClient fatJarClient = new SparkYarnClient(fatJarConfig)) {
+            SparkJobConfig job = SparkJobConfig.builder()
+                    .appName("FatJar-WordCount-" + System.currentTimeMillis())
+                    .mainClass(SimpleSparkApp.class.getName())
+                    .localJarPath(testAppJar.toString())
+                    .addArg(inputHdfsPath)
+                    .addArg(outputHdfsPath)
+                    .deployMode("cluster")
+                    .numExecutors(1)
+                    .executorMemory("512m")
+                    .executorCores(1)
+                    .driverMemory("512m")
+                    .driverCores(1)
+                    .build();
+
+            SubmittedApplication app = fatJarClient.submit(job);
+            assertNotNull(app.getApplicationId(), "Application ID must be assigned");
+
+            ApplicationInfo result = app.waitForTermination(270_000);
+
+            assertEquals(YarnApplicationState.FINISHED, result.getState(),
+                    "Application must finish. Diagnostics: " + result.getDiagnostics());
+            assertEquals(FinalApplicationStatus.SUCCEEDED, result.getFinalStatus(),
+                    "Final status must be SUCCEEDED. Diagnostics: " + result.getDiagnostics());
+
+            Map<String, Integer> expected = new LinkedHashMap<>();
+            expected.put("hello", 2);
+            expected.put("world", 2);
+            expected.put("spark", 3);
+            verifyWordCountOutput(outputHdfsPath, expected);
+        }
+    }
+
+    // ── Distributed cache format tests ──────────────────────────────────────
+
+    @Test
+    @Order(15)
+    void distCacheProperties_usesCommaSeparatedFormat() throws Exception {
+        FileSystem fs = FileSystem.newInstance(URI.create(hdfsUri), conf);
+        try {
+            SparkYarnSubmitter submitter = new SparkYarnSubmitter(
+                    SparkYarnConfig.builder().hdfsUri(hdfsUri).hadoopConf(conf).build(),
+                    fs, null);
+
+            java.net.URI uri1 = new java.net.URI("hdfs", null, "/staging/app.jar", null, null);
+            java.net.URI uri2 = new java.net.URI("hdfs", null, "/staging/data.csv", null, null);
+
+            java.util.List<SparkYarnSubmitter.DistCacheEntry> entries = java.util.Arrays.asList(
+                    new SparkYarnSubmitter.DistCacheEntry(
+                            uri1, "__app__.jar", 1024, 1000000L,
+                            org.apache.hadoop.yarn.api.records.LocalResourceType.FILE),
+                    new SparkYarnSubmitter.DistCacheEntry(
+                            uri2, "data.csv", 2048, 2000000L,
+                            org.apache.hadoop.yarn.api.records.LocalResourceType.FILE)
+            );
+
+            Properties props = submitter.buildDistCacheProperties(entries);
+
+            String filenames = props.getProperty("spark.yarn.cache.filenames");
+            assertNotNull(filenames, "filenames must be set");
+            assertTrue(filenames.contains("__app__.jar"),
+                    "filenames must contain __app__.jar fragment: " + filenames);
+            assertTrue(filenames.contains(","),
+                    "filenames must be comma-separated: " + filenames);
+
+            String sizes = props.getProperty("spark.yarn.cache.sizes");
+            assertEquals("1024,2048", sizes);
+
+            String timestamps = props.getProperty("spark.yarn.cache.timestamps");
+            assertEquals("1000000,2000000", timestamps);
+
+            String types = props.getProperty("spark.yarn.cache.types");
+            assertEquals("FILE,FILE", types);
+
+            String vis = props.getProperty("spark.yarn.cache.visibilities");
+            assertEquals("PRIVATE,PRIVATE", vis);
+
+            assertNull(props.getProperty("spark.yarn.cache.filenames.0"),
+                    "must NOT use indexed format");
+        } finally {
+            fs.close();
+        }
+    }
+
     // ── Keytab distribution test ─────────────────────────────────────────────
 
     @Test
