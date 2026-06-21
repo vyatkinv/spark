@@ -16,6 +16,7 @@ public final class SparkJobConfig {
     private final String appName;
     private final String mainClass;
     private final String localJarPath;
+    private final String hdfsJarPath;
     private final List<String> appArgs;
     private final Map<String, String> sparkConf;
     private final String deployMode;
@@ -33,6 +34,7 @@ public final class SparkJobConfig {
         this.appName = b.appName;
         this.mainClass = b.mainClass;
         this.localJarPath = b.localJarPath;
+        this.hdfsJarPath = b.hdfsJarPath;
         this.appArgs = Collections.unmodifiableList(new ArrayList<>(b.appArgs));
         this.sparkConf = Collections.unmodifiableMap(new HashMap<>(b.sparkConf));
         this.deployMode = b.deployMode;
@@ -50,6 +52,13 @@ public final class SparkJobConfig {
     public String getAppName() { return appName; }
     public String getMainClass() { return mainClass; }
     public String getLocalJarPath() { return localJarPath; }
+    /**
+     * Full HDFS path for the application JAR (e.g. {@code hdfs:///apps/my-app-1.0.jar}).
+     * When set, the submitter checks whether the JAR already exists at this path
+     * and skips the upload if it does; otherwise uploads from {@link #getLocalJarPath()}.
+     * Returns {@code null} if not configured (default upload behaviour).
+     */
+    public String getHdfsJarPath() { return hdfsJarPath; }
     public List<String> getAppArgs() { return appArgs; }
     public Map<String, String> getSparkConf() { return sparkConf; }
     public String getDeployMode() { return deployMode; }
@@ -72,6 +81,7 @@ public final class SparkJobConfig {
         private String appName;
         private String mainClass;
         private String localJarPath;
+        private String hdfsJarPath;
         private final List<String> appArgs = new ArrayList<>();
         private final Map<String, String> sparkConf = new HashMap<>();
         private String deployMode = "cluster";
@@ -98,6 +108,22 @@ public final class SparkJobConfig {
         /** Local filesystem path to the fat-JAR that will be uploaded to HDFS. */
         public Builder localJarPath(String path) {
             this.localJarPath = Objects.requireNonNull(path);
+            return this;
+        }
+
+        /**
+         * Full HDFS destination path for the application JAR
+         * (e.g. {@code hdfs:///apps/my-app-1.0.jar}).
+         *
+         * <p>When set, the submitter first checks whether a file already exists
+         * at this path on HDFS.  If it does, the upload is skipped and the
+         * existing file is used directly.  If it does not, the JAR is uploaded
+         * from {@link #localJarPath} to this location.
+         *
+         * <p>When not set, the JAR is always uploaded to an auto-generated path.
+         */
+        public Builder hdfsJarPath(String path) {
+            this.hdfsJarPath = Objects.requireNonNull(path);
             return this;
         }
 
@@ -155,7 +181,10 @@ public final class SparkJobConfig {
         public SparkJobConfig build() {
             Objects.requireNonNull(appName, "appName is required");
             Objects.requireNonNull(mainClass, "mainClass is required");
-            Objects.requireNonNull(localJarPath, "localJarPath is required");
+            if (localJarPath == null && hdfsJarPath == null) {
+                throw new IllegalStateException(
+                        "Either localJarPath or hdfsJarPath (or both) must be set");
+            }
             return new SparkJobConfig(this);
         }
     }

@@ -87,14 +87,20 @@ public class SparkYarnClient implements Closeable {
     // -------------------------------------------------------------------------
 
     /**
-     * Uploads the fat-JAR to HDFS and submits the Spark application to YARN
-     * without invoking spark-submit.
+     * Uploads the fat-JAR to HDFS (if needed) and submits the Spark application
+     * to YARN without invoking spark-submit.
+     *
+     * <p>When {@link SparkJobConfig#getHdfsJarPath()} is set, the submitter
+     * checks whether the JAR already exists at that HDFS path.  If it does,
+     * the upload is skipped; otherwise the local JAR is uploaded to that path.
+     * When {@code hdfsJarPath} is not set, the JAR is always uploaded to an
+     * auto-generated HDFS location.
      *
      * @param job job parameters
      * @return handle to the submitted application
      */
     public SubmittedApplication submit(SparkJobConfig job) throws Exception {
-        String hdfsJarUri = uploadJar(job.getLocalJarPath());
+        String hdfsJarUri = resolveOrUploadJar(job);
         SparkYarnSubmitter.SubmitResult result = submitter.submit(job, hdfsJarUri);
         return new SubmittedApplication(result.appId, yarnClient, hdfs, result.stagingDir);
     }
@@ -116,6 +122,24 @@ public class SparkYarnClient implements Closeable {
     // HDFS upload
     // -------------------------------------------------------------------------
 
+    private String resolveOrUploadJar(SparkJobConfig job) throws Exception {
+        String hdfsJarPath = job.getHdfsJarPath();
+        if (hdfsJarPath != null) {
+            Path target = new Path(hdfsJarPath);
+            if (hdfs.exists(target)) {
+                log.info("JAR already exists on HDFS, skipping upload: {}", hdfsJarPath);
+                return hdfs.makeQualified(target).toUri().toString();
+            }
+            if (job.getLocalJarPath() == null) {
+                throw new IllegalStateException(
+                        "JAR not found at " + hdfsJarPath
+                        + " and localJarPath is not set — cannot upload");
+            }
+            return uploadJar(job.getLocalJarPath(), target);
+        }
+        return uploadJar(job.getLocalJarPath());
+    }
+
     /**
      * Uploads a local fat-JAR to the configured HDFS directory (overwrite = true).
      *
@@ -126,6 +150,12 @@ public class SparkYarnClient implements Closeable {
         Path src     = new Path(localJarPath);
         Path destDir = resolveJarUploadDir();
         Path dest    = new Path(destDir, src.getName());
+        return uploadJar(localJarPath, dest);
+    }
+
+    private String uploadJar(String localJarPath, Path dest) throws Exception {
+        Path src     = new Path(localJarPath);
+        Path destDir = dest.getParent();
 
         if (config.isKerberosEnabled()) {
             UserGroupInformation.getCurrentUser().doAs(
@@ -138,7 +168,7 @@ public class SparkYarnClient implements Closeable {
         }
 
         log.info("Uploaded {} → {}", localJarPath, dest.toUri());
-        return dest.toUri().toString();
+        return hdfs.makeQualified(dest).toUri().toString();
     }
 
     private Path resolveJarUploadDir() throws IOException {
