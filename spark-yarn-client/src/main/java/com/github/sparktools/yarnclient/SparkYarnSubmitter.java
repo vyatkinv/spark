@@ -801,13 +801,30 @@ class SparkYarnSubmitter {
     private ByteBuffer obtainDelegationTokens() throws Exception {
         Credentials creds = new Credentials();
 
-        // HDFS delegation token
-        hdfs.addDelegationTokens(config.getKerberosPrincipal(), creds);
+        // The renewer for HDFS/RM delegation tokens must be the YARN
+        // ResourceManager principal — the RM is the service that will renew
+        // them on behalf of the running application.  Using the submitter's
+        // own principal would cause renewal failures because that principal
+        // is not authorised as a token renewer in the NameNode.
+        // This matches Spark's Client.scala which delegates to
+        // HadoopFSDelegationTokenProvider → Master.getMasterPrincipal(),
+        // which reads yarn.resourcemanager.principal.
+        String renewer = config.getHadoopConf().get(
+                YarnConfiguration.RM_PRINCIPAL);
+        if (renewer == null || renewer.isEmpty()) {
+            throw new IllegalStateException(
+                    "yarn.resourcemanager.principal is not set in the Hadoop "
+                    + "configuration — cannot obtain delegation tokens. "
+                    + "Set it in yarn-site.xml or via SparkYarnConfig.hadoopConf().");
+        }
+        log.debug("Using delegation token renewer: {}", renewer);
 
-        // RM delegation token — YarnClient returns a YARN Token that must be
-        // converted to a Hadoop security Token before adding to Credentials
+        // HDFS delegation token
+        hdfs.addDelegationTokens(renewer, creds);
+
+        // RM delegation token
         org.apache.hadoop.yarn.api.records.Token rmYarnToken =
-                yarnClient.getRMDelegationToken(new Text(config.getKerberosPrincipal()));
+                yarnClient.getRMDelegationToken(new Text(renewer));
         if (rmYarnToken != null) {
             org.apache.hadoop.security.token.Token<? extends
                     org.apache.hadoop.security.token.TokenIdentifier> rmToken =
